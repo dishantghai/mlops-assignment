@@ -155,6 +155,35 @@ SLO math revised with real numbers:
 
 ---
 
+### Thinking Mode Test
+
+**Script:** `scripts/test_thinking.py`
+**Prompt:** formula_1 schema + complex multi-table question (1,218 tokens)
+
+| Temperature | Wall time | Completion tokens | Thinking triggered |
+|---|---|---|---|
+| 0.7 (model default) | 0.62s | 88 | **No** |
+| 0.0 | 0.54s | 83 | **No** |
+
+**Thinking is NOT triggering via vLLM's OpenAI-compatible API.**
+
+Why: vLLM startup showed `reasoning_backend=''` — the chat template think-enable token is not inserted by default through the API. The model never enters thinking mode through our requests.
+
+Cumulative metrics after 3 total requests:
+```
+Avg TTFT:    54ms   (0.163s / 3)
+Avg ITL:     6.1ms/token  (1.368s / 224 gaps — consistent)
+Avg E2E:     510ms  (1.531s / 3)
+KV cache:    0% throughout
+Warm wall clock: 0.54–0.62s (vs 2.50s cold first-call)
+```
+
+**Implication:** No `/no_think` flag needed in prompts. Output lengths will stay short (80–100 tokens for SQL). This is good for latency — the decode phase stays bounded.
+
+**Next:** Mini concurrent load test — 5 parallel requests to measure TTFT degradation under queue pressure.
+
+---
+
 ## Quick Reference
 
 ```bash
