@@ -19,20 +19,25 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 
 **File:** `scripts/start_vllm.sh`
 **Model:** `Qwen/Qwen3-30B-A3B-Instruct-2507`
+**Current iteration:** Iter 2 (FP8)
 
 ```bash
-# ITER 1 — true baseline (BF16, capped context, all optimizations off)
+# ITER 2 — FP8, capped context, prefix cache off
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port 8000 \
     --max-model-len 8192 \
+    --quantization fp8 \
     --no-enable-prefix-caching \
     --no-enable-chunked-prefill
 ```
 
-**Why these two flags are needed for a clean baseline:**
-vLLM 0.10.x auto-enables `prefix_caching=True` and `chunked_prefill=True` for Qwen3MoE models even with no explicit flags. Without explicitly disabling them, Iter 1 is already a partially-optimized config. Adding them back one at a time in later iterations lets us measure the isolated impact of each.
+**Flag rationale:**
+- `--max-model-len 8192`: mandatory — BF16 default (262144) requires 24 GiB KV, more than the 8.68 GiB available. 8192 gives 5× headroom over our workload max (~1640 tokens).
+- `--quantization fp8`: halves weight footprint (57→29 GiB), frees 28 GiB for KV, reduces ITL under batch decode. Prescribed after Iter 1 confirmed revise path fails SLO by 0.69s.
+- `--no-enable-prefix-caching`: off for clean measurement; Iter 3 will enable this.
+- `--no-enable-chunked-prefill`: silently ignored for Qwen3MoE in vLLM 0.10.x (engine force-enables it regardless).
 
 ---
 
@@ -378,6 +383,73 @@ The decode forward pass reads all weight matrices for every batch step. In BF16,
 **Saw:** ITL dropped 1.33×, wall P95 dropped 1.27×, revise path now under SLO at 10 vLLM RPS.
 **Hypothesized:** The real agent will drive ~25 effective vLLM RPS (10 user RPS × 2.5 LLM calls). At 2.5× load, ITL will degrade further — but starting from 13.6ms (vs 18ms in BF16) gives more margin before hitting SLO. Worth building the agent and testing end-to-end before adding more flags.
 **Next change:** Build Phase 3 agent (verify_node, revise_node), then run the full agent load test to see if the SLO holds at real 10 user RPS. If not, add `--enable-prefix-caching` as Iter 3 lever.
+
+---
+
+## Phase 2 — Observability
+
+**Date:** 2026-06-16
+**Objective:** Prometheus metrics inventory → Grafana dashboard (12 panels)
+
+### Step 1: Metrics Inventory
+
+```bash
+curl localhost:8000/metrics | grep -v "^#" | sort
+```
+
+Captured post-Iter-2 load test (1201 cumulative requests, FP8 idle). Key findings:
+
+| Category | Key Metrics | Idle values |
+|---|---|---|
+| Gauges | `kv_cache_usage_perc`, `num_requests_running`, `num_requests_waiting` | 0.0, 0.0, 0.0 |
+| Counters | `prompt_tokens_total`, `generation_tokens_total`, `num_preemptions_total` | 945K, 67K, 0 |
+| Histograms | `e2e_request_latency_seconds`, `time_to_first_token_seconds`, `time_per_output_token_seconds`, `request_queue_time_seconds` | avgs: 799ms, 46ms, 13.6ms, 3.7µs |
+
+Zero preemptions across all tests — KV cache never stressed.  
+`request_queue_time_seconds` avg = **3.7 microseconds** at 10 RPS FP8 — no backpressure.
+
+Full metric catalogue with PromQL in `mlops-hw3-runlog.md`.
+
+### Step 2: Grafana Dashboard Built
+
+**File:** `infra/grafana/provisioning/dashboards/serving.json` (version: 2)
+**uid:** `vllm-serving` | refresh: 5s | window: last 30m
+
+12 panels across 5 rows:
+
+| Row | Panels | Answers |
+|---|---|---|
+| SLO Health | E2E P50/P95/P99 (w=24, SLO threshold line at 5.0s red) | Is it slow? |
+| Latency Decomp | TTFT P50/P95 (w=12), ITL P50/P95 (w=12) | Where is the slowness? |
+| Queue & Memory | Requests Running/Waiting (w=8), Queue Wait P95 with thresholds (w=8), KV Cache % gauge 0-100 (w=8) | Do I have headroom? |
+| Throughput | Request Rate stop/length (w=8), Gen+Prompt tokens/sec (w=8), Preemptions/sec bar (w=8) | GPU utilization |
+| Quality Signals | Avg Output Tokens (thinking detector, threshold 300) (w=8), Prefix Cache Hit Rate (w=8), Avg Prompt Tokens (w=8) | Prompt drift & thinking mode |
+
+**Histogram PromQL pattern:** `histogram_quantile(0.95, sum(rate(vllm:METRIC_bucket[2m])) by (le))`  
+**KV cache panel:** `vllm:kv_cache_usage_perc * 100` (gauge, thresholds at 60/80/95%)
+
+### Step 3: Dashboard Reload
+
+```bash
+curl -s -X POST http://admin:admin@localhost:3000/api/admin/provisioning/dashboards/reload
+```
+
+### Step 4: Live Verification — 60s × 10 RPS
+
+Ran `uv run python scripts/vllm_load_test.py --rps 10 --duration 60` while watching all 12 Grafana panels.
+
+```
+All 12 panels populated with live data.
+
+E2E P95 (Grafana):   1.614s  ← matches 1.498s wall P95 + ~120ms HTTP overhead
+TTFT P95 (Grafana):  ~59ms   ← chunked prefill keeping this bounded
+ITL avg (Grafana):   ~14ms   ← consistent with Iter 2 batch decode
+KV Cache (Grafana):  ~2.5%   ← massive headroom confirmed
+Queue depth:         0        ← no backpressure at 10 RPS FP8
+Preemptions:         0        ← confirmed across all load tests
+```
+
+**Readable-cold test: PASSED.** A cold reader can identify slow/healthy, prefill vs decode bottleneck, and capacity headroom without any explanation.
 
 ---
 

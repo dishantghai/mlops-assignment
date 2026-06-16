@@ -30,3 +30,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent", "evals", "load_test"]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.60.0",
+]
