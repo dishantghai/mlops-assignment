@@ -18,6 +18,7 @@ graph.invoke() — LangGraph runs sync nodes in a thread executor internally.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -88,40 +89,37 @@ async def answer(req: AnswerRequest) -> AnswerResponse:
     history = final.get("history", [])
     execution = final.get("execution")
 
-    # ── Phase 4: post-run trace metadata ──────────────────────────────────────
-    # iteration==1 → only generate_sql ran (no revise)
-    # iteration>=2 → at least one revise cycle fired
-    #
-    # langfuse 4.x dropped Langfuse.trace(); use the REST upsert endpoint
-    # instead. POST /api/public/traces with the existing trace ID merges our
-    # fields into the trace that the LangChain callback already created.
+    # ── Phase 4: post-run trace metadata (fire-and-forget) ───────────────────
+    # Run flush + REST upsert in a background task so they don't block the
+    # HTTP response. Tracing latency must never add to user-facing E2E latency.
     if handler is not None:
-        try:
-            handler._langfuse_client.flush()
-            lf_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3001")
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{lf_host}/api/public/traces",
-                    auth=(
-                        os.environ["LANGFUSE_PUBLIC_KEY"],
-                        os.environ["LANGFUSE_SECRET_KEY"],
-                    ),
-                    json={
-                        "id": handler.last_trace_id,
-                        "name": "agent_run",
-                        "metadata": {
-                            "db_name": req.db,
-                            "num_iterations": iteration,
-                            "final_ok": bool(final.get("verify_ok", False)),
-                            "revise_triggered": iteration > 1,
-                            "question_id": req.question_id,
-                        },
-                        "tags": [req.db],
-                    },
-                    timeout=5.0,
-                )
-        except Exception:
-            pass  # tracing must never break the answer endpoint
+        trace_id = handler.last_trace_id
+        lf_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3001")
+        lf_pub = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+        lf_sec = os.environ.get("LANGFUSE_SECRET_KEY", "")
+        meta = {
+            "db_name": req.db,
+            "num_iterations": iteration,
+            "final_ok": bool(final.get("verify_ok", False)),
+            "revise_triggered": iteration > 1,
+            "question_id": req.question_id,
+        }
+
+        async def _flush_and_tag() -> None:
+            try:
+                await asyncio.to_thread(handler._langfuse_client.flush)
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{lf_host}/api/public/traces",
+                        auth=(lf_pub, lf_sec),
+                        json={"id": trace_id, "name": "agent_run",
+                              "metadata": meta, "tags": [req.db]},
+                        timeout=5.0,
+                    )
+            except Exception:
+                pass
+
+        asyncio.create_task(_flush_and_tag())
 
     if execution is None:
         return AnswerResponse(

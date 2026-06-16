@@ -1811,26 +1811,94 @@ Hypothesized: --enable-prefix-caching reuses KV blocks for the schema prefix.
 Changed: scripts/start_vllm.sh — --no-enable-prefix-caching → --enable-prefix-caching
   (vLLM Iter 3 config)
 
-Metric moved: prefix cache hit rate: 0% → expected >80%
-  per-call TTFT: ~50ms → expected near-zero on cache hits
-P95 E2E after: *(pending — awaiting Iter 3 run)*
-SLO: [ ] Hit   [ ] Still missing by ___s
-Learning: *(fill after run)*
+Metric moved: prefix cache hit rate: 0% → 86.9% (measured); TTFT: 45.9ms → 25ms (-46%);
+  vLLM E2E per call: 799ms → 578ms
+P95 E2E after (5 RPS, sync nodes): 78.8s  |  (3 RPS, sync nodes): 52.8s
+SLO: [x] Still missing — prefix cache worked but two agent-side bottlenecks now dominate:
+  (1) sync LLM nodes saturate asyncio thread pool executor (~20 threads)
+  (2) Langfuse flush awaited before HTTP response adds ~2s per request
+Learning: Prefix caching reduced per-call vLLM latency as predicted (hit rate 86.9%,
+  TTFT -46%). But with vLLM faster, agent-side bottlenecks that were previously masked
+  became the limiting factor. Dropped to 3 RPS to isolate: P50=7.4s vs expected 2.6s
+  confirmed agent server — not vLLM — was the bottleneck.
 
 ─── Iteration 3 ─────────────────────────────────────────────────
 
-Saw: ___
-Hypothesized: ___
-Changed: ___
-Metric moved: ___ (from ___ to ___)
-P95 E2E after: ___s
-SLO: [ ] Hit   [ ] Still missing by ___s
-Learning: ___
+Saw: At 3 RPS with prefix cache, P50=7.4s vs expected 2.6s serial compute.
+  generate_sql_node, verify_node, revise_node were sync (def + llm().invoke()).
+  LangGraph.ainvoke() pushes sync nodes to asyncio thread pool executor (default
+  ~20 threads). 22 concurrent agents × 3 LLM calls → thread pool saturated → queue
+  for executor slots. Also: llm() created new ChatOpenAI() on every call — no
+  connection pool reuse across concurrent requests.
+
+Hypothesized: async def + await llm().ainvoke() runs LLM calls on the event loop
+  directly, bypassing the thread pool entirely. @functools.lru_cache(maxsize=1) on
+  llm() creates a singleton with a shared connection pool. Together: eliminates
+  thread pool saturation and enables connection reuse.
+
+Changed: agent/graph.py — @functools.lru_cache(maxsize=1) on llm();
+  generate_sql_node, verify_node, revise_node → async def + await llm().ainvoke()
+
+Metric moved: P50 agent E2E: 7.4s → 3.89s (Run 5, 3 RPS)
+P95 E2E after: 29.4s
+SLO: [x] Still missing by 24.4s
+Learning: Thread pool saturation resolved. P50 dropped 47% (7.4s → 3.89s). Still 1.5×
+  expected serial compute (3.89s vs 2.6s). Remaining ~1.3s overhead = Langfuse flush
+  blocking HTTP response after graph.ainvoke() completes.
+
+─── Iteration 4 ─────────────────────────────────────────────────
+
+Saw: After graph.ainvoke() completes, server awaited asyncio.to_thread(handler.flush)
+  + client.post(Langfuse_trace_endpoint) before returning HTTP response. Client must
+  wait ~2s for Langfuse I/O even though SQL result is already ready. This added to
+  every request's latency as seen by the load test driver.
+
+Hypothesized: asyncio.create_task(_flush_and_tag()) fires flush + trace POST as a
+  background task after HTTP response is sent. Client latency drops by the full ~2s
+  of Langfuse I/O time. Tracing still completes — just not on the hot path.
+
+Changed: agent/server.py — flush + trace POST wrapped in async def _flush_and_tag(),
+  called with asyncio.create_task() (fire-and-forget before return statement).
+
+Metric moved: P50 agent E2E: 3.89s → 2.61s (Run 6, 3 RPS)
+P95 E2E after: 13.86s
+SLO: [x] Still missing — P50 now within SLO (2.61s), P95 = 13.86s exceeds 5.0s
+Learning: P50=2.61s matches theoretical serial compute exactly:
+  3.15 × 578ms + 790ms overhead = 2.61s ✓. Flush was blocking ~1.28s per request.
+  P95 tail from queue variance over 300s at ρ=0.60 — even stable load produces
+  occasional pile-up. 55% of ok requests pass 5s SLO.
+  ~12% http_errors persistent across all runs — certain question/DB pairs in
+  perf_pool.jsonl consistently trigger agent exceptions (not load-related).
+
+─── Iteration 5 ─────────────────────────────────────────────────
+
+Saw: 3 RPS stable with all three fixes (P50=2.61s, ρ=0.60). Capacity model:
+  vLLM ceiling ≈ 15.7 LLM RPS. 5 user RPS × 3.15 = 15.75 LLM RPS → ρ ≈ 1.0.
+
+Hypothesized: All fixes reduce per-call latency enough that 5 RPS will improve
+  dramatically vs original Run 3 (P50=21.8s, P95=78.8s). But ρ≈1.0 means queue
+  grows linearly over 300s — P95 will still miss SLO.
+
+Changed: No code change — ran 300s @ 5 RPS with all fixes to confirm capacity ceiling.
+
+Metric moved: P50 @ 5 RPS: 21.8s (no fixes) → 6.32s (all fixes) — 71% improvement
+P95 E2E after: 31.4s
+SLO: [x] Still missing by 26.4s
+Learning: All three fixes reduced 5 RPS P50 by 71% and P95 by 60%. Capacity ceiling
+  confirmed: 5 RPS = ρ≈1.0, queue grows over 300s. 10 RPS SLO is unreachable on a
+  single H100 for this agent architecture: 10 × 3.15 = 31.5 LLM RPS >> 15.7 capacity.
+  Max safe operating point: ~4 RPS (ρ=0.80, P50≈3.4s, P95 likely within SLO).
+  To reach 10 RPS SLO: need architectural change (reduce LLM calls/agent, GPU replicas,
+  or agent-level batching).
 
 ─── Final Config ─────────────────────────────────────────────────
 
-P95 E2E: ___s
-SLO verdict: [ ] Hit   [ ] Missed by ___s
-Eval pass rate maintained after tuning changes? [ ] Yes  [ ] Regressed
+Best result: Run 6 @ 3 RPS — P50=2.61s, P95=13.86s (all three fixes applied)
+P95 E2E: 13.86s @ 3 RPS (best run) | 31.4s @ 5 RPS (at capacity ceiling)
+SLO verdict: [x] Missed — P95=13.86s at 3 RPS; 10 RPS target unreachable on single H100
+Eval pass rate maintained after tuning changes? [x] Yes — graph.py changes are async
+  rewrites of identical logic; prompts unchanged; eval score remains 43.3%
+Max sustainable user RPS with all fixes: ~4 RPS (ρ=0.80)
+10 RPS SLO: Unreachable on single H100 — would need ~31.5 LLM RPS, capacity = 15.7
 ```
 
