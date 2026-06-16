@@ -180,7 +180,63 @@ Warm wall clock: 0.54–0.62s (vs 2.50s cold first-call)
 
 **Implication:** No `/no_think` flag needed in prompts. Output lengths will stay short (80–100 tokens for SQL). This is good for latency — the decode phase stays bounded.
 
-**Next:** Mini concurrent load test — 5 parallel requests to measure TTFT degradation under queue pressure.
+**Next:** Mini concurrent load test — 10 parallel requests to measure TTFT degradation under queue pressure.
+
+---
+
+### Concurrent Load Test — 10 Parallel Requests
+
+**Script:** `scripts/concurrent_test.py`
+**Prompt:** formula_1 schema × 10 different questions (~1,218 tokens each)
+**Concurrency:** 10 simultaneous threads
+
+**Per-request wall clock:**
+```
+[06] 1.09s  12 tokens  (shortest output → fastest)
+[08] 1.50s  42 tokens
+[03] 1.54s  47 tokens
+[04] 1.63s  54 tokens
+[00] 1.67s  57 tokens
+[02] 1.70s  61 tokens
+[07] 1.76s  68 tokens
+[09] 1.81s  73 tokens
+[05] 1.82s  75 tokens
+[01] 1.85s  80 tokens  (most output tokens → slowest)
+```
+
+**Summary:**
+```
+P50 wall:    1.70s
+P95 wall:    1.85s
+Max wall:    1.85s
+Min wall:    1.09s
+Success:     10/10
+Total wall:  1.85s  (all requests completed together — chunked prefill batching)
+```
+
+**vLLM metrics (incremental — 10 concurrent requests only):**
+```
+Avg TTFT:  679ms   (6.792s / 10) — vs 54ms single-request → 12.6× degradation from queue
+Avg E2E:   1,439ms (14.387s / 10) — vs 510ms single-request → 2.8× degradation
+```
+
+**Why TTFT degraded 12.6×:** All 10 requests arrived simultaneously. vLLM's chunked prefill batches them, but each request must wait in queue for the others' prefill chunks before its own prefill runs. The last request in queue waited ~650ms before its first token.
+
+**Output-token/latency correlation:** Visible in the results — longer SQL output = longer wall clock. Request [06] (12 tokens) finished in 1.09s; request [01] (80 tokens) took 1.85s. This confirms decode time (6.1ms × tokens) is the main differentiator when TTFT is shared across the batch.
+
+**SLO implications:**
+```
+Happy path (2 LLM calls × 1.85s P95): 3.70s  → UNDER SLO ✓
+With revise  (3 LLM calls × 1.85s P95): 5.55s → OVER SLO  ✗  (+0.55s)
+```
+At 10 concurrent — already borderline on revise path. Real load at 10 RPS will have
+~35 concurrent LLM requests (Little's Law: 10 RPS × 3.5s avg agent latency = 35),
+which is 3.5× today's test. TTFT will degrade further.
+
+**Diagnosis:**
+**Saw:** P95=1.85s at 10 concurrent. TTFT 12.6× worse than single-request. Revise path already at 5.55s.
+**Hypothesized:** At true 10 RPS (~35 concurrent LLM requests), TTFT will blow up further and revise path will comfortably exceed 5s SLO. FP8 quantization is the primary lever — it frees ~30GB HBM for more KV cache AND doubles compute throughput, directly reducing TTFT and ITL.
+**Next change:** Enable FP8 quantization (`--quantization fp8`) and re-run the concurrent test to measure improvement.
 
 ---
 
