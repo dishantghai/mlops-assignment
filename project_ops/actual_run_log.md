@@ -9,7 +9,8 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 
 | Iter | Key Flags | TTFT P95 | E2E P95 | KV Cache % | Queue Peak | Notes |
 |------|-----------|----------|---------|------------|------------|-------|
-| 0 (baseline) | no flags | — | — | — | — | pending run |
+| 0 | no flags (BF16 defaults) | — | — | — | — | CRASH — KV OOM at startup |
+| 1 | `--max-model-len 8192` | — | — | — | — | pending |
 
 ---
 
@@ -19,11 +20,12 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 **Model:** `Qwen/Qwen3-30B-A3B-Instruct-2507`
 
 ```bash
-# ITER 0 — BASELINE (no optimization flags)
+# ITER 1 — min viable baseline (BF16, capped context)
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
-    --port 8000
+    --port 8000 \
+    --max-model-len 8192
 ```
 
 ---
@@ -38,80 +40,71 @@ exec uv run python -m vllm.entrypoints.openai.api_server \
 
 ---
 
-## Iteration 0 — Baseline
+## Iteration 0 — No-Flag Baseline (CRASH)
 
-**Date:** 2025-06-16
-**Config:** No optimization flags. vLLM defaults.
-**Goal:** Establish raw baseline before any tuning.
+**Date:** 2026-06-16
+**Config:** No flags. Pure vLLM defaults.
+**Outcome:** Crashed at startup. Never served a request.
 
-### Manual Smoke Test (3–5 queries before load test)
+**Saw:**
+- Model loaded in BF16 → weights took **56.93 GiB**
+- Only **8.68 GiB** HBM left for KV cache
+- vLLM defaulted `max_model_len=262144` (model's native 256K window)
+- Minimum KV cache for even one sequence at 262144 tokens = **24 GiB** → impossible
 
-Commands to run on VM:
+**Error:**
+```
+ValueError: To serve at least one request with max seq len (262144),
+24.00 GiB KV cache is needed, larger than available KV cache memory (8.68 GiB).
+Estimated maximum model length is 94784.
+```
+
+**Diagnosis:** BF16 weights leave too little HBM for any meaningful KV cache when context window is uncapped. This is a hard startup failure, not a performance issue.
+
+**Action taken:** Added `--max-model-len 8192` to `scripts/start_vllm.sh`. This caps per-sequence KV allocation so vLLM can at least start and serve within the 8.68 GiB KV budget. Our workload only needs ~1,500 tokens max, so 8192 gives plenty of headroom.
+
+---
+
+## Iteration 1 — BF16 + max-model-len 8192
+
+**Date:** 2026-06-16
+**Config:** `--max-model-len 8192` only. Still BF16.
+**Goal:** Get vLLM running. Establish true first-call latency baseline in BF16. Expect poor concurrency but want to measure it.
+
+### Smoke Test
+
 ```bash
-# 1. Start vLLM
 bash scripts/start_vllm.sh
 
-# 2. Wait for "Application startup complete" in logs, then:
-curl -s localhost:8000/metrics | grep -E "^vllm:(e2e|time_to_first|inter_token|kv_cache|num_requests)" | grep -v "^#"
-
-# 3. Fire one manual query
-curl -s http://localhost:8001/answer \
+# After "Application startup complete":
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"question": "List down Ajax superpowers.", "db": "superhero"}' | jq .
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "messages": [
+      {"role": "user", "content": "Write a SQL query to list all superhero names. Write only SQL, no explanation."}
+    ],
+    "max_tokens": 200
+  }' | jq '{content: .choices[0].message.content, tokens: .usage}'
 
-# 4. Read metrics again after query
-curl -s localhost:8000/metrics | grep -v "^#" | grep "vllm:" | sort
+# Check KV headroom immediately
+curl -s localhost:8000/metrics | grep -v "^#" | grep -E "kv_cache|num_requests"
 ```
 
-### Smoke Test Results
-
-| Query | DB | Latency | SQL Correct? | Iterations |
-|-------|----|---------|--------------|------------|
-| | | | | |
-| | | | | |
-| | | | | |
-
-Thinking mode triggered? [ ] Yes [ ] No
-(Check: did response include `<think>` tokens or very long output?)
-
-### vLLM Metrics After Smoke Test
+### Results
 
 ```
+Weights loaded:     56.93 GiB (BF16 — confirmed)
+KV cache budget:    ___ GiB
+Max seqs possible:  ___
+
+Smoke test latency: ___s (wall clock)
+Thinking triggered: [ ] Yes  [ ] No
+Output tokens:      ___
+
 TTFT P50:   ___s
 TTFT P95:   ___s
-ITL P50:    ___ms
-KV cache %: ___%
-```
-
-### Load Test
-
-```bash
-# Run from project root on VM
-uv run python load_test/driver.py --rps 10 --duration 300 --out results/iter0_baseline.json
-```
-
-### Load Test Results
-
-```
-P50 E2E:        ___s
-P95 E2E:        ___s    [SLO: 5.0s — MISS / HIT]
-P99 E2E:        ___s
-Achieved RPS:   ___
-Timeouts:       ___
-KV cache peak:  ___%
-Queue peak:     ___
-Tokens/sec:     ___
-```
-
-### Grafana Observations
-
-- [ ] KV cache utilization chart captured (screenshot: `screenshots/iter0_kv_cache.png`)
-- [ ] E2E P95 chart captured (screenshot: `screenshots/iter0_e2e_latency.png`)
-- [ ] Queue depth chart captured
-
-Notable patterns:
-```
-___
+KV cache %: ___% (after 1 query)
 ```
 
 ### Diagnosis
@@ -121,12 +114,6 @@ ___
 **Hypothesized:**
 
 **Next change:**
-
----
-
-## Iteration 1 — (TBD after baseline)
-
-*(Fill after Iter 0 results are in.)*
 
 ---
 
