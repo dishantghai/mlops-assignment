@@ -879,3 +879,280 @@ Our load test fires 1200 independent parallel requests. The agent fires 2-3 sequ
 
 **Next step:** Build Phase 3 (implement `verify_node` and `revise_node`), then run the full agent load test with `load_test/driver.py` at 10 user RPS to measure the actual end-to-end SLO.
 
+---
+
+## Phase 2: Observability — Prometheus Metrics Inventory
+
+*Captured: 2026-06-16, vLLM Iter 2 (FP8, max-model-len 8192, no prefix cache)*
+*State: post-load-test (1201 cumulative requests completed, currently idle)*
+
+```bash
+curl localhost:8000/metrics | grep -v "^#" | sort
+```
+
+---
+
+### What vLLM Exposes: Full Metric Catalogue
+
+All vLLM metrics use the `vllm:` prefix. Three Prometheus metric types are used:
+
+| Type | Meaning | How to use in PromQL |
+|------|---------|---------------------|
+| **gauge** | Current instantaneous value, can go up or down | Use directly: `vllm:metric_name` |
+| **counter** | Monotonically increasing total, never decreases | Wrap in `rate()`: `rate(vllm:metric_name[1m])` |
+| **histogram** | Distribution stored as buckets; has `_bucket`, `_sum`, `_count` suffixes | Wrap in `histogram_quantile()`: see below |
+
+For histograms, the PromQL pattern is always:
+```promql
+histogram_quantile(0.95, sum(rate(vllm:METRIC_bucket[5m])) by (le))
+```
+The `[5m]` window means "compute the rate over the last 5 minutes" — this smooths out noise. Use `[1m]` for more responsive panels.
+
+---
+
+### Group 1: Gauges — Current System State
+
+These answer "what is happening RIGHT NOW?"
+
+```
+vllm:num_requests_running  → current sequences being actively processed
+                             [idle=0.0, under load: matches Little's Law concurrency]
+
+vllm:num_requests_waiting  → current queue depth (requests waiting to be scheduled)
+                             [idle=0.0, FP8 10RPS peak=0 — no queuing at current load]
+
+vllm:kv_cache_usage_perc   → fraction of KV cache blocks in use (0.0 to 1.0)
+                             [idle=0.0, FP8 10RPS peak≈0.025 — 2.5% utilization]
+
+vllm:gpu_cache_usage_perc  → appears identical to kv_cache_usage_perc (legacy alias)
+                             [same value, use kv_cache_usage_perc for new dashboards]
+
+vllm:cache_config_info     → static labels, value=1.0 (exists only for label metadata)
+  Labels include:
+    block_size="16"                    ← tokens per KV block
+    num_gpu_blocks="24940"             ← total KV blocks (24940 × 16 = 399,040 tokens)
+    cache_dtype="auto"                 ← KV cache stored in BF16 even though weights are FP8
+    enable_prefix_caching="False"      ← confirms our --no-enable-prefix-caching flag
+    gpu_memory_utilization="0.9"       ← vLLM's default (90% of 80GB = 72GB target)
+    num_cpu_blocks="None"              ← no CPU KV offload configured
+    swap_space="4.0" (GB)             ← CPU swap for preemption if KV overflows
+```
+
+**Reading `cache_config_info`:** This label-only metric is useful for dashboard annotations. The `num_gpu_blocks=24940` tells us our exact KV capacity without needing to do the math. Compare across restarts to confirm config changes took effect.
+
+---
+
+### Group 2: Counters — Cumulative Totals
+
+These increase forever. Use `rate()` to get "per-second" rates.
+
+```
+vllm:prompt_tokens_total = 945,384 tokens
+  → Total input tokens processed since startup (1201 requests × avg 787 prompt tokens)
+  → PromQL for throughput: rate(vllm:prompt_tokens_total[1m])
+  → Under 10 RPS: rate ≈ 787 tokens/request × 10 req/s = ~7,870 prompt tokens/sec
+
+vllm:generation_tokens_total = 67,791 tokens
+  → Total output tokens generated (1201 requests × avg 56.4 tokens)
+  → PromQL: rate(vllm:generation_tokens_total[1m])
+  → Under 10 RPS: rate ≈ 56.4 × 10 = ~564 generation tokens/sec
+
+vllm:num_preemptions_total = 0.0
+  → Times a running sequence was paused because KV cache ran out
+  → CRITICAL: 0 preemptions across all our tests — KV cache was never stressed
+  → Under load: rate(vllm:num_preemptions_total[1m]) > 0 is a red flag (KV pressure)
+
+vllm:request_success_total{finished_reason="stop"}  = 1201
+vllm:request_success_total{finished_reason="length"} = 0
+vllm:request_success_total{finished_reason="abort"}  = 0
+  → "stop" = model hit an EOS token (normal completion)
+  → "length" = model hit max_tokens limit before finishing (output was truncated!)
+  → "abort" = request was cancelled
+  → Having length > 0 means some outputs were cut off — indicates max_tokens too small
+  → PromQL: rate(vllm:request_success_total{finished_reason="stop"}[1m])
+
+vllm:gpu_prefix_cache_hits_total  = 0.0
+vllm:gpu_prefix_cache_queries_total = 0.0
+  → Prefix caching is disabled (confirmed by cache_config_info)
+  → When enabled: hit_rate = hits_total / queries_total × 100%
+  → PromQL for hit rate: vllm:gpu_prefix_cache_hits_total / vllm:gpu_prefix_cache_queries_total
+  → This will become meaningful in Iter 3 when we enable --enable-prefix-caching
+```
+
+---
+
+### Group 3: Histograms — Latency Distributions
+
+These are the most important for SLO monitoring. Each produces P50/P95/P99 via `histogram_quantile()`.
+
+**Latency metrics and their current cumulative averages (Iter 2 FP8, 1201 requests):**
+
+```
+vllm:time_to_first_token_seconds
+  → Prefill phase duration (from request arrival to first output token)
+  → sum=55.13s / count=1201 → avg=45.9ms
+  → PromQL P95: histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))
+  → Observed P95 from histogram: ~59ms (10 RPS FP8 load)
+  → Dashboard panel: "TTFT P50 / P95" — diagnoses prefill bottleneck
+
+vllm:time_per_output_token_seconds   (also aliased as: vllm:inter_token_latency_seconds)
+  → Per-token decode latency (time between consecutive output tokens for a sequence)
+  → sum=904.4s / count=66,590 inter-token gaps → avg=13.6ms/token
+  → PromQL P95: histogram_quantile(0.95, sum(rate(vllm:time_per_output_token_seconds_bucket[5m])) by (le))
+  → Increases with decode batch size (more concurrent sequences → slower per-token)
+  → Dashboard panel: "ITL P50 / P95" — diagnoses decode bottleneck
+
+vllm:e2e_request_latency_seconds
+  → Total vLLM latency = TTFT + decode (does NOT include HTTP overhead)
+  → sum=959.6s / count=1201 → avg=799ms
+  → PromQL P95: histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))
+  → PRIMARY SLO METRIC: this is what must stay low
+  → Dashboard panel: "E2E Latency P50 / P95 / P99" with SLO threshold line at 5.0s
+
+vllm:request_prefill_time_seconds
+  → Total prefill time per request (slightly different from TTFT — excludes queue wait time)
+  → sum=47.3s / count=1201 → avg=39.4ms
+  → Interesting: avg TTFT=45.9ms vs avg prefill=39.4ms → 6.5ms difference = queue overhead
+  → This is a more precise measure of prefill compute (without queuing noise)
+
+vllm:request_decode_time_seconds
+  → Total decode time per request (= N_output_tokens × ITL)
+  → sum=904.4s / count=1201 → avg=753ms
+  → Consistent with: avg 55.4 tokens × 13.6ms/token = 753ms ✓
+
+vllm:request_inference_time_seconds
+  → prefill + decode time combined (no queue component)
+  → sum=951.7s / count=1201 → avg=792ms
+  → Compare to E2E avg=799ms: difference of 7ms = avg queue time (negligible at 10 RPS)
+
+vllm:request_queue_time_seconds
+  → Time spent waiting in queue before inference starts
+  → sum=0.0044s / count=1201 → avg=3.7 MICROSECONDS
+  → KEY INSIGHT: at FP8 10 RPS, queue time is essentially zero. The system has no backpressure.
+  → This will be the FIRST metric to spike when the system approaches saturation
+  → PromQL P95: histogram_quantile(0.95, sum(rate(vllm:request_queue_time_seconds_bucket[5m])) by (le))
+  → Dashboard panel: "Queue Wait Time" — early warning of saturation
+
+vllm:request_prompt_tokens
+  → Distribution of prompt lengths per request
+  → sum=945,384 / count=1201 → avg=787 tokens/request
+  → Use to monitor workload characteristics (alerts if prompt lengths shift unexpectedly)
+
+vllm:request_generation_tokens
+  → Distribution of output token counts per request
+  → sum=67,791 / count=1201 → avg=56.4 tokens/request
+  → Use to detect thinking mode accidentally triggering (would spike to 500–2000 tokens)
+  → Dashboard: "Avg Output Tokens" gauge — alert if consistently > 200 tokens
+
+vllm:iteration_tokens_total
+  → Tokens processed per scheduler step (batch size × tokens per step)
+  → sum=1,013,175 / count=8,897 iterations → avg=113.8 tokens per scheduler iteration
+  → Measures how efficiently the scheduler fills each compute step
+  → Not critical for this workload, but useful for understanding scheduler behavior
+```
+
+---
+
+### Derived Metrics Worth Computing in Grafana
+
+These aren't single metrics — compute them in PromQL:
+
+```promql
+# Request success rate (useful for alerting on errors)
+rate(vllm:request_success_total{finished_reason="stop"}[1m])
+  / rate(vllm:request_success_total[1m])
+
+# Prefix cache hit rate (when prefix caching enabled in Iter 3)
+vllm:gpu_prefix_cache_hits_total
+  / clamp_min(vllm:gpu_prefix_cache_queries_total, 1)
+
+# Token truncation rate (should be 0.0)
+rate(vllm:request_success_total{finished_reason="length"}[1m])
+  / rate(vllm:request_success_total[1m])
+
+# Decode throughput (generation tokens per second)
+rate(vllm:generation_tokens_total[1m])
+
+# Prompt ingestion rate (input tokens per second)
+rate(vllm:prompt_tokens_total[1m])
+```
+
+---
+
+### Dashboard Build Log — Panel-by-Panel Design
+
+The LEARNING_GUIDE asks: what questions should a serving dashboard answer at 3am?
+1. Is it slow? (P95 vs SLO threshold)
+2. Where is the slowness? (TTFT vs ITL decomposition)
+3. Do I have headroom? (KV cache, queue depth)
+
+**7 panels mapped to those 3 questions:**
+
+| Panel | Question | Metric(s) | Type | PromQL |
+|-------|---------|-----------|------|--------|
+| E2E Latency P50/P95/P99 | Is it slow? | `vllm:e2e_request_latency_seconds` | Histogram | `histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))` |
+| TTFT P50/P95 | Where is slowness — prefill? | `vllm:time_to_first_token_seconds` | Histogram | `histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))` |
+| ITL P50/P95 | Where is slowness — decode? | `vllm:time_per_output_token_seconds` | Histogram | `histogram_quantile(0.95, sum(rate(vllm:time_per_output_token_seconds_bucket[5m])) by (le))` |
+| KV Cache % | Do I have headroom? | `vllm:kv_cache_usage_perc` | Gauge | `vllm:kv_cache_usage_perc * 100` |
+| Queue Depth | Am I saturated? | `vllm:num_requests_running`, `vllm:num_requests_waiting` | Gauge | direct |
+| Request Rate | Throughput | `vllm:request_success_total` | Counter | `rate(vllm:request_success_total[1m])` |
+| Token Throughput | GPU utilization | `vllm:generation_tokens_total`, `vllm:prompt_tokens_total` | Counter | `rate(vllm:generation_tokens_total[1m])` |
+
+**Bonus panels worth adding:**
+
+| Panel | Why it's useful |
+|-------|----------------|
+| Queue Wait Time P95 | First metric to spike at saturation (currently 4µs) |
+| Preemption Rate | `rate(vllm:num_preemptions_total[1m])` — KV overflow signal |
+| Avg Output Tokens | Alert if thinking mode accidentally triggers (spikes from 56 to 500+) |
+| Prefix Cache Hit Rate | Will matter in Iter 3 when we enable `--enable-prefix-caching` |
+
+**SLO reference line:** Add a horizontal threshold at `5.0` on the E2E Latency panel. Grafana: "Add threshold" → 5.0 → red. This is the visual anchor for all diagnosis.
+
+---
+
+### Readable-Cold Test — What Each Panel Tells a New Reader
+
+A person opening this dashboard cold should be able to answer:
+
+| Question | Panel | "Healthy" values at Iter 2 FP8, 10 RPS |
+|---------|-------|----------------------------------------|
+| Is the system slow right now? | E2E P95 | < 1.5s (vs 5.0s SLO — lots of margin) |
+| Is prefill the bottleneck? | TTFT P95 | < 60ms (chunked prefill keeping this bounded) |
+| Is decode the bottleneck? | ITL P95 | ~14ms/token at 10 RPS |
+| Is KV cache pressured? | KV Cache % | < 5% (massive headroom with FP8) |
+| Is there a queue buildup? | Requests Waiting | 0 at 10 RPS |
+| What's the throughput? | Request Rate | ~10 req/s |
+| How efficient is the GPU? | Gen Tokens/sec | ~560 tokens/sec |
+
+---
+
+### Dashboard Build Log Template (Fill in as you build)
+
+```
+Dashboard Build Log — Phase 2
+
+Panel Name        | Metric Used                          | PromQL Query                                                                           | Status
+------------------|--------------------------------------|----------------------------------------------------------------------------------------|-------
+E2E P50/P95/P99   | vllm:e2e_request_latency_seconds     | histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) | [ ]
+TTFT P50/P95      | vllm:time_to_first_token_seconds     | histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le)) | [ ]
+ITL P50/P95       | vllm:time_per_output_token_seconds   | histogram_quantile(0.95, sum(rate(vllm:time_per_output_token_seconds_bucket[5m])) by (le))| [ ]
+KV Cache %        | vllm:kv_cache_usage_perc             | vllm:kv_cache_usage_perc * 100                                                          | [ ]
+Requests Running  | vllm:num_requests_running            | vllm:num_requests_running                                                               | [ ]
+Requests Waiting  | vllm:num_requests_waiting            | vllm:num_requests_waiting                                                               | [ ]
+Request Rate      | vllm:request_success_total           | rate(vllm:request_success_total{finished_reason="stop"}[1m])                           | [ ]
+Gen Tokens/sec    | vllm:generation_tokens_total         | rate(vllm:generation_tokens_total[1m])                                                  | [ ]
+Queue Wait P95    | vllm:request_queue_time_seconds      | histogram_quantile(0.95, sum(rate(vllm:request_queue_time_seconds_bucket[5m])) by (le)) | [ ]
+Preemptions/sec   | vllm:num_preemptions_total           | rate(vllm:num_preemptions_total[1m])                                                    | [ ]
+Avg Output Tokens | vllm:request_generation_tokens       | rate(vllm:request_generation_tokens_sum[1m]) / rate(vllm:request_generation_tokens_count[1m]) | [ ]
+Prefix Hit Rate   | vllm:gpu_prefix_cache_hits_total     | vllm:gpu_prefix_cache_hits_total / clamp_min(vllm:gpu_prefix_cache_queries_total, 1)   | [ ]
+
+SLO threshold added at 5.0s on E2E panel: [ ]
+Readable Cold Test: [ ] Passed  [ ] Failed
+Issues: ___________________________
+
+Data source: Prometheus at http://prometheus:9090  (Docker network, not localhost)
+```
+
+**Note on data source URL:** Grafana is running in Docker. It cannot reach `localhost:8000` — it must use the Docker network hostname. Prometheus scrapes vLLM at `http://172.18.0.3:8000/metrics` (or whatever the vLLM container IP is). Grafana queries Prometheus at `http://prometheus:9090` via the Docker network. This is already configured in the Docker compose setup.
+
