@@ -468,3 +468,67 @@ uv run python load_test/driver.py --rps 5 --duration 120 --out results/scratch.j
 # Parse load test output
 cat results/iter0_baseline.json | python3 -c "import json,sys; s=json.load(sys.stdin)['summary']; [print(f'{k}: {v}') for k,v in s.items()]"
 ```
+
+---
+
+## Phase 3 — LangGraph Agent: verify + revise Nodes
+
+**Date:** 2026-06-16
+**Files changed:** `agent/graph.py`, `agent/prompts.py`
+
+### What was implemented
+
+| Item | Description |
+|------|-------------|
+| `GENERATE_SQL_SYSTEM/USER` | SQL expert prompt; output raw SQL only; `{schema}` + `{question}` placeholders |
+| `VERIFY_SYSTEM/USER` | Judge prompt; output only `{"ok": bool, "issue": str}`; lists specific failure cases |
+| `REVISE_SYSTEM/USER` | Fix prompt; takes failing SQL + execution result + issue; output raw corrected SQL |
+| `_parse_verify()` | Defensive JSON extractor — handles fences, string booleans, prose fallback |
+| `verify_node` | Calls LLM with VERIFY prompts; feeds `execution.render()`; returns `{verify_ok, verify_issue}` |
+| `revise_node` | Calls LLM with REVISE prompts (SQL + result + issue + schema); bumps `iteration`; appends to `history` |
+| `route_after_verify` | `"end"` if `verify_ok` or `iteration >= MAX_ITERATIONS`, else `"revise"` |
+
+All prompts prefix `/no_think` in the system message to suppress Qwen3 reasoning mode.
+
+### Level 2 Test — Python Direct Invocation
+
+**Question:** "What is the average number of students enrolled in schools in Los Angeles?"
+**DB:** `california_schools`
+
+```
+Step 1  generate_sql  → SELECT AVG(s.Enrollment) ...  [s.Enrollment does not exist]
+Step 2  verify        → ok=False, issue: "The column 'Enrollment' does not exist in
+                        the schools table; the query should reference the correct column
+                        name for student enrollment."
+Step 3  revise        → SELECT AVG(f."Enrollment (K-12)") ... JOIN frpm f ...
+Step 4  verify        → ok=True
+
+iterations: 2  |  verify_ok: True  |  answer: 691.66 avg students
+```
+
+Loop triggered on a wrong column reference, produced a precise issue string, and revise fixed it on the first attempt.
+
+### Level 4 Test — HTTP via /answer Endpoint
+
+```bash
+# Terminal 1
+uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
+
+# Terminal 2
+curl -s -X POST http://localhost:8001/answer \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "What is the average number of students enrolled in schools in Los Angeles?", "db": "california_schools"}'
+```
+
+Response confirmed: `iterations: 2`, `ok: true`, `rows: [[691.66]]`. HTTP endpoint working end-to-end.
+
+### SLO Projection for Agent
+
+Each agent run makes 2–3 sequential LLM calls. From Iter 2 FP8 per-call wall P95 = 1.498s (at 10 vLLM RPS):
+
+| Path | Calls | Projected agent P95 | SLO (< 5.0s) |
+|------|-------|---------------------|--------------|
+| Happy path (no revise) | 2 | 2 × 1.498 = **2.996s** | PASS ✓ |
+| Revise once | 3 | 3 × 1.498 = **4.494s** | PASS ✓ |
+
+These are projections at 10 vLLM RPS. The real agent drives ~25 effective vLLM RPS (10 user RPS × ~2.5 LLM calls/run). Phase 6 end-to-end load test will measure the actual number.

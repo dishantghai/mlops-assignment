@@ -1345,3 +1345,212 @@ Panel shows no data in Grafana?
     → error: URL should be http://prometheus:9090 (Docker hostname, not localhost)
 ```
 
+---
+
+## Phase 3: Agent Implementation Log
+
+**Date:** 2026-06-16
+**Files:** `agent/graph.py`, `agent/prompts.py`
+**MAX_ITERATIONS:** 3
+
+---
+
+### Understanding the Graph Before Implementing
+
+```
+State machine nodes:
+- attach_schema:  db_id → schema (render_schema, @lru_cache)
+- generate_sql:   (schema, question) → sql, iteration+1  [PROVIDED]
+- execute:        sql → ExecutionResult                  [PROVIDED]
+- verify:         (question, sql, execution.render()) → verify_ok, verify_issue
+- revise:         (schema, question, sql, execution.render(), verify_issue) → sql, iteration+1
+
+Routing (route_after_verify):
+- verify_ok=True  → END
+- iteration >= 3  → END  (cap exhausted)
+- else            → revise → execute → verify  (loop)
+```
+
+**Q: Why is verify a separate LLM call rather than part of generate_sql?**
+
+generate_sql cannot see the execution result — it runs before execute. verify can see what the SQL actually returned (or what error it produced) and judge whether that result answers the question. The separation is what makes the loop useful: generation is optimistic, verification is critical.
+
+**Q: What does execute.render() look like in the verify prompt?**
+
+Three cases:
+- `ERROR: <sqlite3 error message>` — syntactically invalid SQL
+- `OK: 0 rows returned.` — valid SQL, no matches
+- `OK: N rows.\nCOLUMNS: col1, col2\nFIRST ROWS:\n...` — valid SQL with results
+
+The verify prompt must handle all three. The first case is always `ok=False`. The second case is ambiguous — verify must reason about whether zero rows is correct given the question. The third case requires checking whether the columns/values actually answer the question.
+
+**Q: Why is there an iteration cap?**
+
+Without it, a broken revise prompt could loop forever (or until the model produces the same wrong SQL repeatedly). At MAX_ITERATIONS=3, the worst case is: generate → verify(fail) → revise → execute → verify(fail) → revise → execute → verify(whatever). Three total generate/revise calls, then forced END.
+
+---
+
+### Design Decisions
+
+**Output format for verify:** `{"ok": bool, "issue": str}` — small, parseable, no prose. The issue string is the key: it feeds directly into the revise prompt. A vague issue ("result seems wrong") produces a vague revision. A specific issue ("column 'Enrollment' does not exist in schools table") produces a targeted fix.
+
+**Defensive JSON parsing (`_parse_verify`):** Models occasionally wrap JSON in markdown fences or add prose before/after. The parser tries four strategies in order:
+1. Strip markdown fence, extract first `{...}`, `json.loads()`
+2. Try `json.loads()` on raw text
+3. Scan raw text for `"ok": false` substring
+4. Default to `ok=True` (never loop on parse failure)
+
+Defaulting to `ok=True` on parse failure is deliberate: it's better to accept a potentially wrong result than to spin infinitely on a misbehaving response. The eval will catch accuracy regressions.
+
+**`/no_think` in system prompts:** Qwen3 models have a thinking mode that generates `<think>...</think>` blocks before answering. This is confirmed NOT triggering via our vLLM API (`reasoning_backend=''` at startup). The `/no_think` prefix is kept as a safety net in case the API configuration changes — it has no cost when thinking is already disabled.
+
+**Temperature:** `temperature=0.0` for all nodes (the shared `llm()` function). For SQL generation and revision, determinism is valuable — we want the same correct fix every time, not varied attempts. For verify, `temperature=0.0` produces consistent judgments. Slightly higher temperature for verify was considered but rejected: our vLLM P95 SLO (1.5s/call) leaves no room for retries on judgment variance.
+
+**Revise includes full schema:** revise_node passes `state.schema` to the REVISE prompt so the model can look up the correct column names. Without the schema, revise can only guess at the fix based on the error message alone. With the schema, it can look up `f."Enrollment (K-12)"` from the `frpm` table DDL.
+
+**History tracking:** Both verify_node and revise_node append to `state.history`. This gives the HTTP response (and future Langfuse traces) a complete audit trail of what each node did and why. The history is not fed back into prompts — each call gets only the current state, not all prior attempts. Showing multiple failed attempts was considered but rejected: it would lengthen the context window, increase latency, and risk the model fixating on a wrong approach.
+
+---
+
+### Prompt Engineering
+
+**GENERATE_SQL_SYSTEM:**
+```
+/no_think
+You are an expert SQLite query writer. Given a database schema and a question, output a single valid SQLite SELECT query that answers the question.
+
+Rules:
+- Output ONLY the raw SQL query — no markdown fences, no explanation, no commentary
+- Use only tables and columns that appear in the schema
+- Wrap identifiers containing spaces or SQLite reserved words in double quotes
+- Do not end the query with a semicolon
+```
+
+Design notes: "Output ONLY the raw SQL" and the explicit "no markdown fences" prevents wrapping. The double-quote rule is important for BIRD schemas — columns like `"Enrollment (K-12)"` have spaces and must be quoted. `_extract_sql()` in graph.py strips fences anyway, but it's better not to rely on the fallback.
+
+**VERIFY_SYSTEM:**
+```
+/no_think
+You are a SQL result auditor. Given a question, the SQL that was executed, and its result, decide whether the result correctly answers the question.
+
+Respond with ONLY a JSON object — no markdown, no prose, nothing else:
+
+If correct:  {"ok": true}
+If wrong:    {"ok": false, "issue": "<one precise sentence describing the problem and what needs to change>"}
+
+Guidelines for marking ok=false:
+- Execution returned an error string → always false
+- Result has zero rows but the question implies matching rows should exist → false (name the likely missing clause or wrong filter)
+- Result columns do not match what the question asks → false (name the mismatch)
+- Aggregation or count is clearly wrong given the question → false
+- If the result is plausible and no clear error is visible, return {"ok": true}
+```
+
+Design notes: Explicit failure cases prevent the model from being too strict (rejecting correct zero-row results) or too permissive (accepting error strings). The "name the likely missing clause" instruction pushes toward specific, actionable issue strings.
+
+**REVISE_SYSTEM:**
+```
+/no_think
+You are an expert SQLite query writer fixing a query that did not correctly answer a question.
+
+Output ONLY the corrected SQL query — no markdown fences, no explanation, no commentary.
+
+Rules:
+- Address the specific issue described; avoid rewriting parts that are correct
+- Use only tables and columns that appear in the schema
+- Wrap identifiers containing spaces or SQLite reserved words in double quotes
+- Do not end the query with a semicolon
+```
+
+Design notes: "Avoid rewriting parts that are correct" prevents the model from discarding a mostly-correct query and starting over, which risks introducing new errors. The model uses the issue string to perform a targeted fix.
+
+---
+
+### Test Results
+
+#### Level 2 — Python Direct (`graph.invoke`)
+
+**Question:** "What is the average number of students enrolled in schools in Los Angeles?"
+**DB:** `california_schools`
+
+```
+History:
+  Step 1  generate_sql: SELECT AVG(s.Enrollment) AS average_enrollment
+                        FROM schools s JOIN frpm f ON s.CDSCode = f.CDSCode
+                        WHERE s.County = 'Los Angeles'
+                        → s.Enrollment: column does not exist in schools table
+
+  Step 2  verify: ok=False
+                  issue: "The column 'Enrollment' does not exist in the schools table;
+                  the query should reference the correct column name for student enrollment."
+
+  Step 3  revise: SELECT AVG(f."Enrollment (K-12)") AS average_enrollment
+                  FROM schools s JOIN frpm f ON s.CDSCode = f.CDSCode
+                  WHERE s.County = 'Los Angeles'
+                  → correctly uses frpm.Enrollment (K-12) from the schema DDL
+
+  Step 4  verify: ok=True
+
+iterations: 2  |  answer: 691.66
+```
+
+**What this confirms:**
+- generate_sql made a reasonable but wrong guess (`s.Enrollment` instead of `f."Enrollment (K-12)"`)
+- verify caught the column error from the execution error string and produced a specific issue
+- revise used the issue string + schema DDL to find the correct column in `frpm`
+- second verify accepted the corrected result
+- route_after_verify returned "end" because verify_ok=True
+
+#### Level 3 — Harder Questions
+
+Tested multi-condition HAVING queries and multi-table join queries (formula_1 database). Model produced correct SQL on first pass for all — iterations stayed at 1, verify returned ok=True immediately. This is expected: Qwen3-30B-A3B is a capable model; the revise loop provides a safety net for the ~20–30% of questions where generation fails, not a crutch for a weak generator.
+
+#### Level 4 — HTTP via /answer Endpoint
+
+Server started with `uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001`. Same Level 2 question via curl returned:
+
+```json
+{
+  "sql": "SELECT AVG(f.\"Enrollment (K-12)\") ...",
+  "rows": [[691.658250676285]],
+  "iterations": 2,
+  "ok": true,
+  "history": [
+    {"node": "generate_sql", "sql": "SELECT AVG(s.Enrollment) ..."},
+    {"node": "verify", "ok": false, "issue": "The column 'Enrollment'..."},
+    {"node": "revise", "sql": "SELECT AVG(f.\"Enrollment (K-12)\")..."},
+    {"node": "verify", "ok": true, "issue": ""}
+  ]
+}
+```
+
+HTTP endpoint confirmed working. The `history` field in the response is the audit trail that Langfuse (Phase 4) will trace at the span level.
+
+---
+
+### Phase 3 Experiment Log
+
+```
+Node: verify_node
+Issue caught: wrong column name (s.Enrollment → does not exist)
+How detected: execution returned error string from SQLite; verify LLM identified the bad column
+Issue string produced: "The column 'Enrollment' does not exist in the schools table;
+  the query should reference the correct column name for student enrollment."
+Revise result: Fixed to f."Enrollment (K-12)" on first revise attempt
+
+Node: revise_node
+Input issue: column does not exist
+SQL before revise: SELECT AVG(s.Enrollment) AS average_enrollment FROM schools s JOIN frpm f ...
+SQL after revise:  SELECT AVG(f."Enrollment (K-12)") AS average_enrollment FROM schools s JOIN frpm f ...
+Did it fix the problem? Yes — second verify returned ok=True
+
+Iteration cap tested: [ ] Yes  [x] No (cap not reached in any test — model fixed correctly within 1 revise)
+At cap behavior: route_after_verify returns "end" regardless of verify_ok when iteration >= MAX_ITERATIONS
+
+Prompt iterations:
+v1 prompt for verify: [listed above — used in production]
+Problem with v1: None observed in testing — verify output clean JSON on all test runs
+v1 revise: [listed above]
+Problem with v1: None — targeted fix on first attempt
+```
+
