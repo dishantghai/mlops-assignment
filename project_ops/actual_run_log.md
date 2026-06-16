@@ -10,7 +10,7 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 | Iter | Key Flags | TTFT P95 | E2E P95 | KV Cache % | Queue Peak | Notes |
 |------|-----------|----------|---------|------------|------------|-------|
 | 0 | no flags (BF16 defaults) | — | — | — | — | CRASH — KV OOM at startup |
-| 1 | `--max-model-len 8192 --no-prefix-cache` (chunked prefill forced on) | 62ms | 399ms (vLLM) / 2.50s (wall) | 0% | 0 | single-request only, no load yet |
+| 1 | `--max-model-len 8192 --no-prefix-cache` (chunked prefill forced on) | **59ms** | **1.059s** avg / **1.895s** P95 wall | ~14% | 0 | 10 RPS × 120s, 1200/1200 ok |
 
 ---
 
@@ -236,7 +236,69 @@ which is 3.5× today's test. TTFT will degrade further.
 **Diagnosis:**
 **Saw:** P95=1.85s at 10 concurrent. TTFT 12.6× worse than single-request. Revise path already at 5.55s.
 **Hypothesized:** At true 10 RPS (~35 concurrent LLM requests), TTFT will blow up further and revise path will comfortably exceed 5s SLO. FP8 quantization is the primary lever — it frees ~30GB HBM for more KV cache AND doubles compute throughput, directly reducing TTFT and ITL.
-**Next change:** Enable FP8 quantization (`--quantization fp8`) and re-run the concurrent test to measure improvement.
+**Next change:** Run the 10 RPS load test to verify. (Mini concurrent tested burst only — need sustained load.)
+
+---
+
+### Sustained 10 RPS Load Test — 120 seconds
+
+**Script:** `scripts/vllm_load_test.py`
+**Target:** vLLM directly (port 8000), bypassing agent (agent Phase 3 not implemented yet)
+**Load:** 10 RPS × 120s = 1,200 total requests
+**Prompts:** Real questions from `evals/eval_set.jsonl` with real schemas (376–1,338 tokens)
+
+**Per-request wall clock summary:**
+```
+P50:   0.971s
+P95:   1.895s  ← SLO boundary = 5.0s
+P99:   2.285s
+Max:   2.394s
+```
+
+**Success rate:** 1200/1200  |  0 timeouts  |  0 http_errors  |  achieved 9.93 RPS
+
+**vLLM Prometheus metrics (post-test cumulative, 1213 total requests):**
+```
+TTFT avg:        52.2ms  (vs 62ms single-req  → similar, queue barely delayed prefill)
+TTFT P95:        59.4ms  (histogram interpolation: 97.7% ≤ 60ms, 99.2% ≤ 80ms)
+ITL  avg:        18.0ms/token  (vs 6.1ms single-req → 3.0× degradation from batch decode)
+E2E  avg:        1,059ms  (vs 399ms single-req → 2.7× degradation)
+Avg output:      55.8 tokens/request
+KV cache peak:   ~14% est.  (10.59 concurrent × 1,256 tokens / 94,784 budget)
+```
+
+**Why TTFT stayed low but ITL tripled:**
+- Chunked prefill allows vLLM to batch prefills in chunks — TTFT doesn't spike because prefill 
+  chunks interleave with decode, keeping the queue from completely blocking.
+- ITL (decode throughput) goes from 6.1ms → 18ms because at ~10 concurrent sequences in decode, 
+  each forward pass generates 1 token for ALL sequences but takes ~180ms (vs 6ms × 1 = 6ms 
+  for single sequence). Each sequence waits for ALL others in the batch → 3× per-token latency.
+- KV cache is NOT the bottleneck at 10 RPS. Only 14% utilization — plenty of headroom.
+
+**SLO analysis for the agent (once Phase 3 is built):**
+
+| Agent path | LLM calls | Projected P95 | SLO (< 5.0s) |
+|---|---|---|---|
+| Happy path | 2 | 2 × 1.895 = 3.79s | **PASS** |
+| Revise once | 3 | 3 × 1.895 = 5.69s | **FAIL** (+0.69s) |
+
+But this projection is optimistic — it assumes 10 vLLM RPS. The agent serving 10 user RPS with
+~2.5 avg LLM calls per user request = **25 effective vLLM RPS**. At 2.5× load, ITL will worsen
+further, pushing both paths higher.
+
+**Diagnosis:**
+**Saw:** At 10 vLLM RPS, P95=1.895s. Revise path (3 calls) = 5.69s → SLO bust. KV cache NOT
+the bottleneck (14% peak). Bottleneck is compute throughput (ITL 3× degraded from batching).
+
+**Hypothesized:** FP8 quantization addresses both failure modes:
+1. Halves weight memory (57GB → ~31GB), nearly doubles available KV budget
+2. Increases compute throughput → lower ITL under batch decode
+These together should cut ITL degradation under load and bring the revise path under 5s.
+
+**Next change:** Enable `--quantization fp8` and re-run the 10 RPS load test to measure improvement.
+
+*Note: FP8 is prescribed BECAUSE we observed a specific failure — revise path exceeds SLO under
+load due to compute-bound ITL degradation. Not added speculatively.*
 
 ---
 
