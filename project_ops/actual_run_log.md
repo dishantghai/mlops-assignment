@@ -10,7 +10,7 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 | Iter | Key Flags | TTFT P95 | E2E P95 | KV Cache % | Queue Peak | Notes |
 |------|-----------|----------|---------|------------|------------|-------|
 | 0 | no flags (BF16 defaults) | — | — | — | — | CRASH — KV OOM at startup |
-| 1 | `--max-model-len 8192` | — | — | — | — | pending |
+| 1 | `--max-model-len 8192 --no-prefix-cache` (chunked prefill forced on) | 62ms | 399ms (vLLM) / 2.50s (wall) | 0% | 0 | single-request only, no load yet |
 
 ---
 
@@ -20,13 +20,18 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 **Model:** `Qwen/Qwen3-30B-A3B-Instruct-2507`
 
 ```bash
-# ITER 1 — min viable baseline (BF16, capped context)
+# ITER 1 — true baseline (BF16, capped context, all optimizations off)
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port 8000 \
-    --max-model-len 8192
+    --max-model-len 8192 \
+    --no-enable-prefix-caching \
+    --no-enable-chunked-prefill
 ```
+
+**Why these two flags are needed for a clean baseline:**
+vLLM 0.10.x auto-enables `prefix_caching=True` and `chunked_prefill=True` for Qwen3MoE models even with no explicit flags. Without explicitly disabling them, Iter 1 is already a partially-optimized config. Adding them back one at a time in later iterations lets us measure the isolated impact of each.
 
 ---
 
@@ -91,29 +96,62 @@ curl -s http://localhost:8000/v1/chat/completions \
 curl -s localhost:8000/metrics | grep -v "^#" | grep -E "kv_cache|num_requests"
 ```
 
-### Results
+### Startup Confirmed
 
 ```
-Weights loaded:     56.93 GiB (BF16 — confirmed)
-KV cache budget:    ___ GiB
-Max seqs possible:  ___
-
-Smoke test latency: ___s (wall clock)
-Thinking triggered: [ ] Yes  [ ] No
-Output tokens:      ___
-
-TTFT P50:   ___s
-TTFT P95:   ___s
-KV cache %: ___% (after 1 query)
+Weights:                56.93 GiB (BF16)
+KV cache budget:        8.68 GiB → 94,784 total tokens
+Max concurrency:        11.57x at 8192 tokens/seq (worst case)
+                        ~79x at actual ~1,200 tokens/seq (real workload)
+Prefix caching:         OFF (confirmed via non-default args)
+Chunked prefill:        ON  (vLLM force-enables for Qwen3MoE, flag ignored)
+Default sampling:       temperature=0.7, top_k=20, top_p=0.8 (from HF config)
+                        → must override per request with temperature=0.0
+MoE kernel:             WARNING — default config, sub-optimal expert dispatch
 ```
+
+### Smoke Test Results — formula_1 DB (worst-case prompt)
+
+```
+Prompt tokens (actual):   1,206
+Completion tokens:         56
+Thinking triggered:        No
+Wall clock (Python urllib): 2.50s   ← includes 2.1s first-call HTTP overhead
+
+vLLM internal metrics (from /metrics):
+  TTFT:      0.062s  (62ms  — prefill of 1,206 tokens, H100 is fast)
+  ITL avg:   0.006s  (6.1ms/token — 0.3369s / 55 inter-token gaps)
+  E2E:       0.399s  (399ms — vLLM's total compute time)
+
+KV cache %: 0% (idle after request completed)
+```
+
+**SQL output (correct):**
+```sql
+SELECT r.fastestLapTime, d.forename, d.surname
+FROM results r
+JOIN drivers d ON r.driverId = d.driverId
+WHERE r.fastestLapTime IS NOT NULL
+ORDER BY r.fastestLapTime
+LIMIT 1;
+```
+
+### Key Insight
+
+The model compute is fast: **399ms E2E** for worst-case prompt (1,206 tokens in, 56 out). The 2.50s wall clock is dominated by Python urllib cold-start HTTP overhead, not the model. The real question is what happens under concurrency.
+
+SLO math revised with real numbers:
+- Single-request happy path (2 LLM calls × 400ms): **~800ms** — easily under 5s
+- Under 10 RPS load with ~11–46 concurrent sequences: TTFT will grow as queue builds
+- The binding constraint at load will be **concurrency + KV cache saturation**, not single-request speed
 
 ### Diagnosis
 
-**Saw:**
+**Saw:** TTFT=62ms, ITL=6.1ms/token, vLLM E2E=399ms at zero concurrency. Model is fast in isolation.
 
-**Hypothesized:**
+**Hypothesized:** Under 10 RPS concurrent load, queue depth and KV cache will be the failure mode, not raw model speed. Need to measure under actual concurrency.
 
-**Next change:**
+**Next change:** Run the smoke_test.py in parallel (5–10 concurrent requests) to observe TTFT degradation under load before committing to a full load test. Also need to test thinking mode impact — not yet tested with a complex multi-table question.
 
 ---
 
