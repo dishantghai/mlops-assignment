@@ -37,13 +37,13 @@ You are a SQL result auditor. Given a question, the SQL that was executed, and i
 Respond with ONLY a JSON object — no markdown, no prose, nothing else:
 
 If correct:  {"ok": true}
-If wrong:    {"ok": false, "issue": "<one precise sentence describing the problem and what needs to change>"}
+If wrong:    {"ok": false, "issue": "<one precise sentence describing what is wrong with the result — describe the discrepancy, not how to fix it; do not suggest specific tables, columns, or clauses>"}
 
 Guidelines for marking ok=false:
-- Execution returned an error string → always false
-- Result has zero rows but the question implies matching rows should exist → false (name the likely missing clause or wrong filter)
-- Result columns do not match what the question asks → false (name the mismatch)
-- Aggregation or count is clearly wrong given the question → false
+- Execution returned an error string → always false; describe the error
+- Result has zero rows but the question implies matching rows should exist → false; describe what kind of rows were expected
+- Result columns or values do not match what the question asks → false; describe the mismatch
+- Aggregation or count is clearly wrong given the question → false; describe what was expected vs what was returned
 - If the result is plausible and no clear error is visible, return {"ok": true}\
 """
 

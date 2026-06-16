@@ -1554,3 +1554,152 @@ v1 revise: [listed above]
 Problem with v1: None — targeted fix on first attempt
 ```
 
+---
+
+## Phase 5 — Evaluation
+
+### Why Execution Accuracy, Not String Match
+
+Two SQL queries can produce the same result set while being syntactically different. `SELECT a, b FROM t ORDER BY a` and `SELECT b, a FROM t ORDER BY 1` could be equivalent for a given dataset — string match would call them different; execution accuracy calls them the same. BLEU is worse: a single keyword difference (`COUNT(*)` vs `COUNT(1)`) scores poorly despite being functionally identical.
+
+**Execution accuracy** runs both gold SQL and agent SQL against the actual SQLite database and compares the result sets after canonicalization. This is the only metric that captures semantic correctness.
+
+### Canonicalization Design
+
+Before implementing, the rules must be explicit to avoid subtle eval signal corruption:
+
+| Decision | Rationale |
+|----------|-----------|
+| Sort rows before comparing | SQL has no guaranteed row order unless ORDER BY is specified. Sorting prevents false negatives when gold and agent SQL produce the same rows in different orders. |
+| Lowercase column names | SQLite column names from `cursor.description` can vary by alias. BIRD guidance says ignore case. |
+| Strip whitespace on string values | Trailing spaces in SQLite text columns should not cause a mismatch. |
+| `None` ≠ `0` | Do not coerce NULL → 0. A query that returns NULL where gold returns 0 is genuinely wrong. |
+| Float precision | Round to 6 decimal places before comparing (SQLite float repr can drift by 1e-12). |
+
+### Per-Iteration Pass Rate Logic
+
+The agent's `/answer` response includes `iterations` (the final `state.iteration` value). The counter maps as:
+- `iterations == 1`: only `generate_sql` ran (no revise triggered) → **iter0 attempt was kept**
+- `iterations == 2`: one revise cycle — `generate_sql` + one `revise` → **iter1 attempt was kept**
+- `iterations == 3`: two revise cycles → **iter2/final**
+
+Per-iteration pass rates:
+- `iter0_pass_rate` = % correct where `iterations == 1` (first-try correct, no loop needed)
+- `iter1_pass_rate` = % correct where `iterations <= 2`
+- `final_pass_rate` = % correct overall (any number of iterations)
+
+The loop earns its keep if `final_pass_rate > iter0_pass_rate`. If they are equal, verify is not catching real errors (too permissive) or revise is not fixing them (prompt issue). If `final_pass_rate < iter0_pass_rate`, verify has false positives — it is rewriting correct SQL into incorrect SQL.
+
+### Eval Runner Structure
+
+```
+evals/run_eval.py
+│
+├── load eval_set.jsonl           → list of {id, question, db, db_path, gold_sql}
+├── for each question:
+│   ├── POST /answer → {sql, rows, iterations, ok, error}
+│   ├── run gold_sql against db_path → gold_rows
+│   ├── run agent sql against db_path → agent_rows  (if ok=True, else skip)
+│   ├── canonicalize(gold_rows) == canonicalize(agent_rows) → correct: bool
+│   └── record {question_id, db, correct, iterations, ok, error}
+│
+├── compute summary:
+│   ├── overall_pass_rate, iter0_pass_rate, iter1_pass_rate, final_pass_rate
+│   └── per_db breakdown
+│
+└── write results/eval_baseline.json
+```
+
+Error handling:
+- Agent HTTP error (5xx, timeout) → `correct=False`, `error="http_error"`, continue
+- Agent `ok=False` (execution error) → `correct=False`, record `error` from response
+- Gold SQL error → skip question (data quality issue, not agent issue), log warning
+
+### Hypotheses Before Running
+
+**Hypothesis A — loop genuinely helps:** `final_pass_rate` is 5–15pp above `iter0_pass_rate`. Expected because BIRD multi-table join questions commonly fail on first generation with the wrong column name or missing JOIN condition, and the verify prompt is designed to catch these.
+
+**Hypothesis B — loop neutral:** `iter0_pass_rate ≈ final_pass_rate`. Would mean verify is either never triggering (too permissive) or revise is not using the issue string effectively. Diagnosis path: check Langfuse traces for revise frequency.
+
+**Hypothesis C — regression:** `final_pass_rate < iter0_pass_rate`. Would mean verify has false positives — marking correct SQL as wrong and handing it to revise which corrupts it. Check cases where `iterations > 1 AND correct == False`.
+
+### Phase 5 Experiment Log
+
+```
+Eval Results Log
+
+Run date: 2026-06-16
+vLLM config version: Iter 2 FP8 (--max-model-len 8192 --quantization fp8)
+Wall clock: 42.2s total (~1.4s avg per question)
+Total questions: 30  |  Scoreable: 30  |  Gold errors: 0
+
+Overall pass rate:     13/30 = 43.3%
+iter0 pass rate:       12/30 = 40.0%
+iter1 pass rate:       12/30 = 40.0%
+iter2/final pass rate: 13/30 = 43.3%
+
+Is the loop earning its keep?
+[x] Yes (+3.3pp)
+
+questions_revised: 13   revision_helped: 2   revision_hurt: 1
+
+Top failure patterns observed:
+1. Schema value conventions not in DDL (5 questions — thrombosis × 3, toxicology × 2):
+   element stored as 'cl'/'ca', label as '+'/'-', Admission as '-' for outpatient.
+   Model cannot infer these from DDL alone. Not fixable with prompt tuning.
+
+2. Wrong column for domain concept (thrombosis IGG questions): agent joined
+   Examination instead of Laboratory, used wrong column name and incorrect
+   gender-split threshold for normal range.
+
+3. Verify rejects correct result (1 question — california_schools Reading):
+   iter0 returned correct answer via fragile frpm self-join. Verify flagged the
+   SQL structure (not the result). Revise hallucinated a non-existent 'districts'
+   table → cascaded to column error. This is the revision_hurt=1 case.
+
+Grafana observations during eval run:
+- Peak KV cache utilization: ~2.5%  (sequential, low concurrency)
+- P95 E2E latency during eval: ~3–4s per request
+- Any queue buildup? None
+
+Per-DB breakdown:
+| DB | Questions | Correct | Pass% |
+|----|-----------|---------|-------|
+| student_club          | 4 | 3 | 75.0% |
+| financial             | 3 | 2 | 66.7% |
+| superhero             | 3 | 2 | 66.7% |
+| codebase_community    | 5 | 3 | 60.0% |
+| california_schools    | 3 | 1 | 33.3% |
+| card_games            | 3 | 1 | 33.3% |
+| formula_1             | 4 | 1 | 25.0% |
+| thrombosis_prediction | 3 | 0 |  0.0% |
+| toxicology            | 2 | 0 |  0.0% |
+```
+
+### Prompt Tuning Attempt (Post-Baseline)
+
+**What was tried:** After diagnosing the california_schools Reading failure via
+Langfuse trace, patched `VERIFY_SYSTEM` to say "describe what is wrong with the
+result — not how to fix it; do not suggest specific tables, columns, or clauses."
+
+**Why it was tried:** Verify's issue string said "should join to 'districts' table
+instead" — revise took this literally, hallucinated a non-existent table, and
+cascaded to a fatal column error across all 3 revise attempts.
+
+**Result:** Re-ran eval → `results/eval_after_tuning.json`. Score unchanged at
+43.3%. The Reading question still fails identically: verify still rejects the
+iter0 SQL (flagging the suspicious join approach, not the result), and revise
+still produces the same broken self-join ending in a column error.
+
+**Why the patch was insufficient:** Verify is evaluating SQL structure rather than
+result correctness. Fixing it requires telling verify to evaluate RESULTS ONLY —
+not whether the SQL approach is elegant. This is a deeper prompt redesign. The
+remaining 16 failures are not verify false-positives; they are genuine generation
+errors driven by: (a) schema value knowledge gaps and (b) complex multi-step
+reasoning the model didn't get right on generation. No verify/revise prompt change
+addresses category (a).
+
+**Outcome:** Accepting 43.3% as both baseline and after-tuning. The verify prompt
+patch is captured in `agent/prompts.py` as a marginal improvement in issue string
+quality (less prescriptive), even though it did not change the pass rate.
+

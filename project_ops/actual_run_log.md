@@ -532,3 +532,105 @@ Each agent run makes 2–3 sequential LLM calls. From Iter 2 FP8 per-call wall P
 | Revise once | 3 | 3 × 1.498 = **4.494s** | PASS ✓ |
 
 These are projections at 10 vLLM RPS. The real agent drives ~25 effective vLLM RPS (10 user RPS × ~2.5 LLM calls/run). Phase 6 end-to-end load test will measure the actual number.
+
+---
+
+## Phase 5 — Evaluation
+
+**Date:** 2026-06-16
+**Script:** `evals/run_eval.py`
+**Dataset:** `evals/eval_set.jsonl` — 30 questions across 9 BIRD databases
+**vLLM config:** Iter 2 FP8 (`--max-model-len 8192 --quantization fp8`)
+**Agent endpoint:** `http://localhost:8001/answer`
+**Output:** `results/eval_baseline.json`
+
+### Canonicalization Rules
+
+| Rule | Decision |
+|------|----------|
+| Row order | Sort both result sets before comparing |
+| Column names | Case-insensitive (lowercase both) |
+| None vs 0 | Treated as distinct (do not coerce) |
+| String whitespace | Strip leading/trailing whitespace |
+
+### Eval Results
+
+```
+Run date: 2026-06-16
+vLLM config version: Iter 2 FP8
+Wall clock: 42.2s for 30 questions (~1.4s avg per question)
+
+Total questions: 30  |  Scoreable: 30  |  Gold errors: 0
+
+Overall pass rate:     13/30 = 43.3%
+iter0 pass rate:       12/30 = 40.0%
+iter1 pass rate:       12/30 = 40.0%
+iter2/final pass rate: 13/30 = 43.3%
+
+Loop:  questions_revised=13  revision_helped=2  revision_hurt=1
+
+Is the loop earning its keep?
+[x] Yes (+3.3pp above iter0)
+```
+
+### Per-DB Breakdown
+
+| DB | Questions | Correct | Pass% |
+|----|-----------|---------|-------|
+| student_club | 4 | 3 | 75.0% |
+| financial | 3 | 2 | 66.7% |
+| superhero | 3 | 2 | 66.7% |
+| codebase_community | 5 | 3 | 60.0% |
+| california_schools | 3 | 1 | 33.3% |
+| card_games | 3 | 1 | 33.3% |
+| formula_1 | 4 | 1 | 25.0% |
+| thrombosis_prediction | 3 | 0 | 0.0% |
+| toxicology | 2 | 0 | 0.0% |
+
+### Top Failure Patterns
+
+```
+1. Schema value conventions not in DDL — toxicology stores element as 'cl'/'ca'
+   (abbreviations) and label as '+'/'-'. thrombosis uses '-' for outpatient
+   admission. Model cannot infer these from column names alone; no prompt
+   change can fix without sample data.
+
+2. Wrong column for domain concept — thrombosis IGG normal range is in the
+   Laboratory table, not Examination. Agent joined the wrong table and used
+   wrong column name / range threshold.
+
+3. Verify rejects correct result (SQL structure concern) — california_schools
+   Reading question: iter0 returned the right answer via an unusual frpm
+   self-join. Verify flagged the SQL approach as fragile, triggering revise
+   which hallucinated a non-existent 'districts' table and cascaded to failure.
+   This is the revision_hurt=1 case.
+```
+
+### Grafana During Eval
+
+```
+Peak KV cache utilization: ~2.5%  (sequential eval, low concurrency)
+P95 E2E latency (eval run): ~3–4s per request (2–3 LLM calls × ~1.5s each)
+Queue buildup observed: None
+```
+
+### Prompt Tuning Attempt
+
+Patched `VERIFY_SYSTEM` after baseline run: changed issue field from "describing
+the problem and what needs to change" to "describing what is wrong with the
+result — not how to fix it; do not suggest specific tables, columns, or clauses."
+
+Re-ran eval → results/eval_after_tuning.json: **identical 43.3%**.
+
+Root cause is deeper: verify is evaluating SQL structure (unusual join pattern)
+rather than the result. The affected question needs verify to be purely
+result-focused, not query-focused. Remaining failures (thrombosis × 3,
+toxicology × 2) are schema value knowledge issues — unfixable by prompt alone.
+
+### Saw / Hypothesized / Result
+
+**Hypothesized:** Loop would add 5–15pp. BIRD multi-table joins expected to fail on first generation and benefit from the revise cycle.
+
+**Saw:** 43.3% final, 40.0% iter0, +3.3pp. Loop helped 2, hurt 1. Biggest failure clusters: thrombosis_prediction (0/3) and toxicology (0/2) — schema value conventions unknown to the model. Prompt patch did not move the score.
+
+**Result:** Loop is net-positive but marginal (+3.3pp). Primary gap is generate_sql hallucinating schema value representations not derivable from the DDL. Accepting 43.3% as eval_baseline and 43.3% as eval_after_tuning — verify prompt patch is captured but ineffective.
