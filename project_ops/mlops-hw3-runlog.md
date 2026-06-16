@@ -190,3 +190,165 @@ When P95 misses the SLO, the first diagnostic questions are:
 
 A P95 at 7s when avg is 4s tells you the tail is being driven by the revise cases — those extra 2s are a third LLM call. The fastest path to hitting the SLO may be improving the generate_sql prompt quality to reduce revision rate, rather than tuning the serving infrastructure further.
 
+---
+
+## Phase 1 Pre-Work: Understanding Qwen3-30B-A3B as a MoE Model
+
+---
+
+### Q1: Why does 30B total / 3B active parameters change the GPU memory picture vs a dense model?
+
+In a **dense** model (e.g. Llama-3-30B), every token's forward pass touches every one of the 30B parameters. All weights must live in HBM (GPU memory) simultaneously, and every matrix multiply for every token reads from all of them.
+
+In a **MoE** model like Qwen3-30B-A3B, the architecture splits the FFN (feed-forward network) layer at each transformer block into many small "expert" sub-networks. Each token is routed through only a sparse subset — for Qwen3-30B-A3B, ~8 experts out of 64 total are activated per token. The "3B active" means that for any single token, only ~3B parameters participate in computation; the other ~27B sit idle in memory.
+
+**The GPU memory picture changes in two important ways:**
+
+**1. Weight storage cost is set by total parameters, not active ones.**
+
+All 30B parameters (weights) must still be loaded into HBM before any inference begins — vLLM cannot leave unneeded experts on CPU during a forward pass because which experts get activated changes dynamically per token. So weight memory is determined by total params, not active params:
+
+```
+BF16 weights: 30.5B params × 2 bytes = ~61 GB
+FP8 weights:  30.5B params × 1 byte  = ~30.5 GB
+```
+
+(Confirmed by SOLUTIONS_REFERENCE.md: BF16 ~60–70 GB, FP8 ~30–35 GB.)
+
+**2. Compute cost per forward pass is determined by active parameters.**
+
+Only ~3B params are multiply-accumulated per token per pass. This is why MoE models are fast for their size: a Qwen3-30B-A3B forward pass costs roughly the same FLOPS as a dense 3B model, but with the knowledge capacity of a 30B model. Prefill time and ITL both benefit from this.
+
+**The H100 80GB single-GPU consequence:**
+
+- **BF16**: ~61 GB for weights leaves only ~19 GB for KV cache, activations, and CUDA overhead. This is dangerously tight. At ~192 KB per token in KV (see Q3 below), you can only hold ~98,000 tokens of KV cache — roughly 30–40 concurrent sequences at our prompt lengths. Under any real load, KV cache fills up fast and preemption begins.
+- **FP8**: ~31 GB for weights leaves ~49 GB for KV cache — roughly 2.5× the headroom. **FP8 is not optional on a single H100 for this workload; it's the difference between the SLO being achievable and not.**
+
+---
+
+### Q2: MoE sparsity — what does it mean for KV cache size?
+
+This is one of the most important architectural subtleties of MoE models.
+
+**Dense model attention**: every token attends to every other token in the sequence via the attention mechanism. The key and value projections (K and V) produce tensors that must be cached across all layers so future decode steps can attend back to the full context without recomputing it.
+
+**MoE model attention**: the attention layers in Qwen3-30B-A3B are **not sparse**. The MoE sparsity only applies to the FFN layers that follow each attention block. The attention itself is full — every token still attends to the full context.
+
+**The KV cache formula:**
+
+```
+KV cache per token = 2 (K and V) × num_layers × num_kv_heads × head_dim × bytes_per_element
+```
+
+For Qwen3-30B-A3B (architecture verified from the model config):
+- `num_hidden_layers`: 48
+- `num_key_value_heads`: 8 (uses GQA — Grouped Query Attention, reducing KV heads vs query heads)
+- `head_dim`: 128
+- BF16 = 2 bytes per element
+
+```
+KV per token (BF16) = 2 × 48 × 8 × 128 × 2 = 196,608 bytes ≈ 192 KB per token
+KV per token (FP8 kv-cache-dtype) = 2 × 48 × 8 × 128 × 1 = 98,304 bytes ≈ 96 KB per token
+```
+
+**The conclusion:** MoE sparsity gives you zero KV cache savings. A Qwen3-30B-A3B sequence occupies the same KV footprint as a hypothetical dense model with identical attention architecture (48 layers, 8 KV heads, 128 head dim). The 27B "inactive" FFN expert weights are irrelevant to KV cache sizing.
+
+**Practical implication for our workload:**
+
+At 46 concurrent sequences (Little's Law from Q3, Phase 1) with ~950 tokens average:
+```
+KV cache needed = 46 sequences × 950 tokens × 192 KB = ~8.4 GB (BF16 KV)
+```
+
+That fits within both BF16 (~19 GB headroom) and FP8 (~49 GB headroom) scenarios — but BF16 leaves only ~10 GB margin before OOM, which gets eaten by CUDA reserved memory, activations, and framework overhead. FP8 weights + BF16 KV is the sensible middle ground. Setting `--kv-cache-dtype fp8` would halve KV usage further if latency quality holds.
+
+---
+
+### Q3: What is Expert Parallelism (EP) vs Tensor Parallelism (TP), and when would you use each?
+
+**Tensor Parallelism (TP):**
+
+TP splits individual weight matrices across multiple GPUs. For a single linear layer of shape `[d_in, d_out]`, with TP=4, each GPU holds a `[d_in, d_out/4]` shard. Every forward pass requires an all-reduce across all TP GPUs to combine the partial results. This adds communication overhead but lets you serve models too large for a single GPU.
+
+- Use when: the model doesn't fit on one GPU, or you need the raw throughput of parallelized matrix multiplies.
+- Downside: every token's forward pass requires inter-GPU communication (the all-reduce). Latency per token increases because you're waiting for network/NVLink.
+- For Qwen3-30B-A3B on a single H100 with FP8 (~31 GB weights): **TP is not needed**. Set `--tensor-parallel-size 1`.
+
+**Expert Parallelism (EP):**
+
+EP is MoE-specific. Instead of splitting individual weight matrices, you assign different experts to different GPUs. With 64 experts and EP=4, GPU 0 holds experts 0–15, GPU 1 holds experts 16–31, etc. When a token is routed to expert 23, its activations are sent over NVLink to GPU 1, processed, and the result is sent back.
+
+- Use when: you have multiple GPUs and the MoE expert count is large enough to distribute meaningfully.
+- Advantage over TP for MoE: avoids the all-reduce bottleneck — only the tokens that need a given GPU's experts communicate with it.
+- Downside: introduces all-to-all communication during expert routing, which can be latency-expensive at small batch sizes.
+- For our setup (single H100): **EP is irrelevant**. vLLM handles MoE routing entirely within the single GPU — tokens are dispatched to the active expert weights in HBM without any inter-GPU traffic.
+
+**The practical rule:** TP for when a model is too large for one GPU. EP for when you have multiple GPUs and a MoE model whose expert count maps well to your GPU count. On a single H100 with FP8, use neither.
+
+---
+
+### Q4: Does Qwen3-30B-A3B fit on a single H100 80GB in BF16? In FP8?
+
+**BF16:**
+
+```
+Model weights: ~61 GB
+CUDA reserved + framework overhead: ~5–8 GB
+Available for KV cache: ~11–14 GB
+```
+
+It **technically fits** — the model loads without OOM. But the KV cache budget is ~11–14 GB, which at 192 KB/token gives roughly 57,000–73,000 tokens of KV capacity. At `--max-model-len 8192` and 32 concurrent sequences: 32 × 8,192 × 192 KB = ~50 GB — **that overflows in BF16**. You'd need to dramatically reduce `--max-num-seqs` or `--max-model-len` to avoid OOM, which hurts throughput.
+
+**BF16 verdict: technically loads, practically unusable for our concurrency target.**
+
+**FP8:**
+
+```
+Model weights: ~31 GB (Qwen3-30B-A3B-Instruct-2507 has pre-quantized FP8 weights on HuggingFace)
+CUDA reserved + framework overhead: ~5–8 GB
+Available for KV cache: ~41–44 GB
+```
+
+At 32 concurrent sequences × 8,192 max tokens × 192 KB/token = ~50 GB... still tight. This is why `--gpu-memory-utilization 0.90` with `--max-num-seqs 32` and `--max-model-len 8192` is the recommended combination — it keeps peak KV allocation within the ~44 GB FP8 headroom (90% of 80 GB = 72 GB, minus ~31 GB weights = 41 GB for KV, with vLLM allocating KV cache lazily based on actual usage, not worst-case).
+
+**FP8 verdict: fits comfortably for our workload. This is the required config.**
+
+**Key note on pre-quantized weights:** Qwen3-30B-A3B-Instruct-2507 ships with FP8-quantized weights directly from Hugging Face. Using `--quantization fp8` in vLLM loads these pre-quantized weights directly — no on-the-fly quantization penalty at startup. This is unlike some models where `--quantization fp8` triggers dynamic quantization at load time, which can take extra minutes.
+
+---
+
+### Q5: Thinking mode vs non-thinking mode — which to use for each agent node?
+
+Qwen3 models default to "thinking mode": before producing an answer, the model generates a `<think>...</think>` block with chain-of-thought reasoning. This is useful for hard reasoning tasks but catastrophic for inference latency in our case.
+
+**The output length impact:**
+
+A generate_sql call without thinking: ~60–180 output tokens (just the SQL)
+A generate_sql call with thinking: ~600–2,500 output tokens (reasoning trace) + 60–180 (SQL) = 660–2,680 tokens
+
+At ITL ~20ms/token (FP8 H100):
+- No thinking: 80 tokens × 20ms = **1.6s decode**
+- With thinking: 1,500 tokens × 20ms = **30s decode** — a single call blows the entire 5s SLO
+
+**Per-node recommendation:**
+
+| Node | Mode | Reason |
+|---|---|---|
+| `generate_sql` | `/no_think` | SQL is deterministic and structured. No reasoning benefit; major latency cost. |
+| `verify` | `/no_think` | Verify output is a tiny JSON `{"ok": bool, "issue": str}`. Thinking is wasteful. |
+| `revise` | `/no_think` | The issue string from verify already encodes what to fix. No open-ended reasoning needed. |
+
+**How to disable thinking:**
+
+Option 1 — System prompt suffix (simplest, works in all vLLM versions):
+```
+You are a SQL expert. Generate only valid SQLite SQL. /no_think
+```
+
+Option 2 — vLLM chat completion parameter:
+```python
+llm().invoke(messages, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+```
+
+**Temperature per node:** With thinking disabled, use `temperature=0.0` or `0.1` for generate and revise (deterministic SQL), and `temperature=0.3` for verify (the model needs some reasoning flexibility to judge whether a result is correct, but you still want consistency).
+
