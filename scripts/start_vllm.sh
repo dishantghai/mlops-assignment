@@ -12,5 +12,6 @@ exec uv run python -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0 \
     --port 8000 \
     --max-model-len 8192 \
+    --quantization fp8 \
     --no-enable-prefix-caching \
     --no-enable-chunked-prefill

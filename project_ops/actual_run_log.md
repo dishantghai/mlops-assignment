@@ -7,10 +7,11 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 
 ## Config History
 
-| Iter | Key Flags | TTFT P95 | E2E P95 | KV Cache % | Queue Peak | Notes |
-|------|-----------|----------|---------|------------|------------|-------|
+| Iter | Key Flags | TTFT P95 | E2E avg | Wall P95 | KV% | Notes |
+|------|-----------|----------|---------|----------|-----|-------|
 | 0 | no flags (BF16 defaults) | — | — | — | — | CRASH — KV OOM at startup |
-| 1 | `--max-model-len 8192 --no-prefix-cache` (chunked prefill forced on) | **59ms** | **1.059s** avg / **1.895s** P95 wall | ~14% | 0 | 10 RPS × 120s, 1200/1200 ok |
+| 1 | `--max-model-len 8192 --no-prefix-cache` BF16 | 59ms | 1,059ms | **1.895s** | ~14% | 1200/1200 ok — revise path FAILS SLO (5.685s) |
+| 2 | + `--quantization fp8` | 59ms | 799ms | **1.498s** | ~2.5% | 1200/1200 ok — **revise path PASSES SLO (4.494s)** ✓ |
 
 ---
 
@@ -299,6 +300,84 @@ These together should cut ITL degradation under load and bring the revise path u
 
 *Note: FP8 is prescribed BECAUSE we observed a specific failure — revise path exceeds SLO under
 load due to compute-bound ITL degradation. Not added speculatively.*
+
+---
+
+## Iteration 2 — FP8 Quantization
+
+**Date:** 2026-06-16
+**Change from Iter 1:** Added `--quantization fp8` to `scripts/start_vllm.sh`
+**Hypothesis:** FP8 halves weight memory bandwidth → reduces ITL degradation under batch decode → revise path (3 calls) drops from 5.685s to under 5.0s SLO.
+
+### Startup Facts
+
+```
+Weights:          29.08 GiB  (was 56.93 GiB BF16 → 51% smaller)
+KV cache budget:  36.53 GiB → 399,040 tokens  (was 8.68 GiB → 94,784 → 4.2× more KV)
+Load time:        ~14s  (vs ~273s BF16 — pre-quantized FP8 weights on HuggingFace)
+Prefix caching:   OFF (confirmed)
+Chunked prefill:  ON  (still force-enabled for Qwen3MoE, cannot disable)
+MoE kernel:       WARNING — default config still (same as BF16, not FP8-specific)
+```
+
+### Single-Request Smoke Test (FP8, formula_1, 1206 tokens in, 57 out)
+
+```
+TTFT:   47.3ms  (was 62ms BF16 → 1.31× faster)
+ITL:    6.1ms/token  (same as BF16 — at zero concurrency, compute is not bandwidth-limited)
+E2E:    390ms  (was 399ms → essentially same at zero concurrency)
+```
+
+At zero concurrency, FP8 only improves TTFT (faster prefill from lower memory bandwidth for weights). ITL improvement requires concurrent load to be meaningful.
+
+### Sustained 10 RPS Load Test — 120 seconds
+
+**Script:** `scripts/vllm_load_test.py`
+**Config:** Same as Iter 1 except `--quantization fp8`
+
+**Per-request wall clock:**
+```
+P50:   0.712s  (was 0.971s → 1.37× faster)
+P95:   1.498s  (was 1.895s → 1.27× faster)
+P99:   1.811s  (was 2.285s → 1.26× faster)
+Max:   2.261s
+```
+
+**Success rate:** 1200/1200  |  0 timeouts  |  0 http_errors  |  achieved 9.95 RPS
+
+**vLLM Prometheus metrics (1201 cumulative, ≈1200 from load test):**
+```
+TTFT avg:    45.9ms  (was 52.2ms → 1.14× faster)
+TTFT P95:    59.1ms  (was 59.4ms → same — already bottomed out by chunked prefill)
+ITL  avg:    13.6ms/token  (was 18.0ms → 1.33× faster — the key improvement)
+E2E  avg:    799ms  (was 1,059ms → 1.33× faster)
+Avg output:  55.4 tokens/request
+KV cache:    ~2.5%  (8.0 concurrent × 1,256 tokens / 399,040 budget)
+```
+
+**SLO verdict:**
+
+| Agent path | LLM calls | Iter 1 BF16 | Iter 2 FP8 | SLO (< 5.0s) |
+|---|---|---|---|---|
+| Happy path | 2 | 3.790s | **2.996s** | **PASS** ✓ |
+| Revise once | 3 | 5.685s ✗ | **4.494s** | **PASS** ✓ |
+
+**The revise path flipped from FAIL to PASS. FP8 delivered 1.191s improvement on the revise path.**
+
+**Why FP8 reduced ITL by 1.33×:**
+The decode forward pass reads all weight matrices for every batch step. In BF16, weight reads = 57 GB × per-batch scan. In FP8, weight reads = 29 GB — half the memory bandwidth pressure. Each forward pass completes faster → each sequence in the decode batch gets its next token sooner → ITL decreases. This is pure memory-bandwidth relief, not FLOP reduction (the arithmetic is still full-precision for key computations, only weight storage is FP8).
+
+**Concurrency change:**
+- Iter 1 BF16: avg E2E 1.059s → Little's Law = 10 × 1.059 = 10.6 concurrent sequences
+- Iter 2 FP8:  avg E2E 0.799s → Little's Law = 10 × 0.799 = 8.0 concurrent sequences
+- Fewer concurrent sequences in decode → smaller batch → lower ITL → self-reinforcing improvement
+
+**KV cache now trivially utilized (2.5% vs 14%).** FP8 unlocked 4.2× more KV budget, but we're not KV-constrained. The extra KV headroom is reserve capacity for future load increases or longer prompts.
+
+**Diagnosis:**
+**Saw:** ITL dropped 1.33×, wall P95 dropped 1.27×, revise path now under SLO at 10 vLLM RPS.
+**Hypothesized:** The real agent will drive ~25 effective vLLM RPS (10 user RPS × 2.5 LLM calls). At 2.5× load, ITL will degrade further — but starting from 13.6ms (vs 18ms in BF16) gives more margin before hitting SLO. Worth building the agent and testing end-to-end before adding more flags.
+**Next change:** Build Phase 3 agent (verify_node, revise_node), then run the full agent load test to see if the SLO holds at real 10 user RPS. If not, add `--enable-prefix-caching` as Iter 3 lever.
 
 ---
 

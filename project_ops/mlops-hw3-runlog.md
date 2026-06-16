@@ -744,3 +744,138 @@ The bottleneck is compute throughput — specifically, ITL degrading 3× under b
 
 This is a hypothesis. The next iteration (Iter 2) will measure it.
 
+---
+
+## Phase 1 Iteration Log — Iter 2 (FP8 Quantization)
+
+### Why FP8 Comes From the Model Hub, Not On-the-Fly
+
+Before running, one important question: when you pass `--quantization fp8` to vLLM for Qwen3-30B-A3B-Instruct-2507, does it quantize on-the-fly at load time, or load pre-quantized weights?
+
+The answer depends on the model. Qwen3-30B-A3B-Instruct-2507 ships with **pre-quantized FP8 checkpoint files** on Hugging Face (`.safetensors` files where weights are already stored as `float8_e4m3fn`). vLLM detects this from the model config and loads the quantized weights directly — no conversion happens at runtime.
+
+**Evidence from startup log:**
+```
+Model loading took 29.0788 GiB and 14.059883 seconds
+```
+vs BF16:
+```
+Model loading took 56.9342 GiB and 273.130 seconds
+```
+
+Load time dropped from 273s to 14s — a 19× speedup, purely from reading 29 GB instead of 57 GB off disk. If vLLM were quantizing on-the-fly, load time would be longer (it would need to read BF16 then convert), not shorter.
+
+**What `--quantization fp8` actually does:** Signals to vLLM that the checkpoint uses FP8 format and that the kernel should use FP8 matrix multiply (CUTLASS FP8 kernels on H100). It does NOT trigger any quantization at load time for this model. For models without pre-quantized weights, the same flag would trigger slower on-the-fly quantization.
+
+---
+
+### Startup Comparison: BF16 vs FP8
+
+| Metric | BF16 (Iter 1) | FP8 (Iter 2) | Change |
+|---|---|---|---|
+| Weight size | 56.93 GiB | 29.08 GiB | -49% (half the memory) |
+| Load time | 273s | 14s | -95% |
+| KV cache budget | 8.68 GiB | 36.53 GiB | **+4.2×** |
+| KV token capacity | 94,784 | 399,040 | **+4.2×** |
+| Max concurrent at 8192 tok/seq | ~11.5 | ~48.7 | **+4.2×** |
+| Max concurrent at 1256 tok/seq | ~75 | ~317 | **+4.2×** |
+
+The FP8 KV budget improvement comes entirely from the freed weight memory — vLLM computes `gpu_memory_utilization × total_HBM - weight_bytes = KV_budget`. With 29 GB weights instead of 57 GB, 28 extra GiB is available for KV.
+
+---
+
+### Single-Request FP8 Smoke Test
+
+Same prompt as BF16 smoke test (formula_1 schema, 1,206 tokens in, 57 out).
+
+```
+BF16:  TTFT=62ms   ITL=6.1ms  E2E=399ms
+FP8:   TTFT=47ms   ITL=6.1ms  E2E=390ms
+Delta: TTFT 1.31×  ITL same   E2E same
+```
+
+**Why TTFT improved but ITL didn't (at zero concurrency):**
+
+Prefill (TTFT) is memory-bandwidth-bound even at single sequence. The GPU must read all weight matrices to process 1,206 tokens in one pass. In FP8, weight reads are halved → prefill finishes faster → TTFT drops 1.31×.
+
+Decode (ITL) at single sequence is **compute-bound** at H100 peak FLOP rates — the GPU has so much compute headroom for a single sequence that memory bandwidth is NOT the bottleneck. FP8 improves bandwidth, not FLOP rate, so ITL at zero concurrency is unchanged.
+
+**This tells us FP8 benefit is a CONCURRENCY story.** The improvement only appears when the decode batch is large enough that weight reads become the bottleneck (batch size ≫ 1). At that point, halving the read size per forward pass directly halves the time per decode step → halves ITL degradation under load.
+
+---
+
+### Sustained 10 RPS Load Test — FP8 Results
+
+**Script:** `scripts/vllm_load_test.py`
+**Config:** Same as Iter 1 + `--quantization fp8`
+**Prompts:** Identical sampling (same seed=42, same eval_set.jsonl)
+
+**Results (1200 requests, 120 seconds):**
+
+```
+Achieved RPS:  9.95 (target: 10.0)
+Success:       1200/1200 — 0 timeouts, 0 errors
+
+Wall-clock latency:
+  P50:  0.712s  (was 0.971s)
+  P95:  1.498s  (was 1.895s)
+  P99:  1.811s  (was 2.285s)
+  Max:  2.261s  (was 2.394s)
+```
+
+**vLLM Prometheus metrics (cumulative 1201 = 1 smoke + 1200 load):**
+
+| Metric | Iter 1 BF16 | Iter 2 FP8 | Improvement |
+|---|---|---|---|
+| TTFT avg | 52.2ms | 45.9ms | 1.14× faster |
+| TTFT P95 | 59.4ms | 59.1ms | ~same |
+| ITL avg | 18.0ms/tok | **13.6ms/tok** | **1.33× faster** |
+| E2E avg | 1,059ms | **799ms** | **1.33× faster** |
+| KV utilization | ~14% | **~2.5%** | 5.6× more headroom |
+
+**Reading the TTFT difference: why P95 barely moved but avg improved:**
+
+TTFT avg went from 52.2ms → 45.9ms (1.14× faster). But P95 stayed the same (59ms). Why?
+
+The histogram shows that in both BF16 and FP8, >97% of TTFT values fall under 60ms. TTFT is already so well-bounded by chunked prefill that there's no meaningful tail to improve. The avg improvement (52 → 46ms) reflects faster prefill per chunk, but the P95 was already near the floor.
+
+The ITL improvement is where FP8 earns its value: 18.0ms → 13.6ms (1.33×). Let's unpack this:
+- At 10 RPS, avg E2E = 799ms → Little's Law: 10 × 0.799 = **8.0 concurrent sequences**
+- At 10 RPS with BF16, avg E2E = 1059ms → 10.59 concurrent sequences
+- FP8 reduced concurrency by 2.6 sequences because faster E2E means requests leave the system sooner
+- Smaller batch → each forward pass reads less KV → even less time per step → self-reinforcing
+
+**Why this is a positive feedback loop:**
+FP8 → faster forward pass → lower ITL → lower E2E avg → fewer concurrent sequences → smaller decode batch → even faster forward pass. The concurrency difference (8.0 vs 10.6) amplifies the raw bandwidth improvement.
+
+---
+
+### SLO Verdict: Before and After FP8
+
+At 10 vLLM RPS (direct test, not yet through agent):
+
+| Agent path | Iter 1 BF16 | Iter 2 FP8 | SLO (< 5.0s) |
+|---|---|---|---|
+| Happy path (2 calls) | 3.790s | **2.996s** | PASS → PASS |
+| Revise path (3 calls) | 5.685s ✗ | **4.494s** | **FAIL → PASS** ✓ |
+
+**FP8 delivered exactly what was hypothesized: 1.19s improvement on the revise path, flipping it from fail to pass.**
+
+The revise path now has a 506ms margin under SLO. This margin will shrink at real agent load (25 effective vLLM RPS), but FP8 has established a much better baseline to absorb that pressure.
+
+---
+
+### What We Still Don't Know After Iter 2
+
+Two unknowns remain before we can declare SLO compliance:
+
+**1. Real 25 effective vLLM RPS behavior**
+
+Our tests ran at 10 vLLM RPS. The agent at 10 user RPS will generate ~25 effective vLLM RPS. At 2.5× load, Little's Law gives us ~20 concurrent sequences instead of 8. Decode batch size grows → ITL will increase from 13.6ms. By how much? We'd need to test at 25 vLLM RPS, or simply build the agent and run the real end-to-end load test.
+
+**2. Effect of sequential chaining vs pure concurrency**
+
+Our load test fires 1200 independent parallel requests. The agent fires 2-3 sequential requests per user query, with each sequential call seeing whatever concurrency the other users' parallel calls are generating. The P95 of a chained sequence is NOT simply 2 × P95 of one call — it's the sum of two independent draws from the latency distribution, which can be modeled as a convolution. P95 of the chain ≈ P77 × 2 (since two independent calls both hitting P77 each independently → joint P95). So the real agent P95 is slightly better than our naive projection of `N × P95_single`.
+
+**Next step:** Build Phase 3 (implement `verify_node` and `revise_node`), then run the full agent load test with `load_test/driver.py` at 10 user RPS to measure the actual end-to-end SLO.
+
