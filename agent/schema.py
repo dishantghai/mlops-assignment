@@ -24,6 +24,10 @@ def _q(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
 
+def _fmt_val(v: object) -> str:
+    return f"'{v}'" if isinstance(v, str) else str(v)
+
+
 @lru_cache(maxsize=32)
 def render_schema(db_id: str) -> str:
     path = db_path(db_id)
@@ -49,6 +53,14 @@ def render_schema(db_id: str) -> str:
                     line += " PRIMARY KEY"
                 if notnull and not pk:
                     line += " NOT NULL"
+                if not pk and ctype.upper().startswith("TEXT"):
+                    rows = conn.execute(
+                        f"SELECT DISTINCT {_q(name)} FROM {_q(t)} "
+                        f"WHERE {_q(name)} IS NOT NULL LIMIT 11"
+                    ).fetchall()
+                    if 1 <= len(rows) <= 10 and all(len(str(r[0])) <= 25 for r in rows):
+                        examples = ", ".join(_fmt_val(r[0]) for r in rows[:3])
+                        line += f"  /* e.g. {examples} */"
                 col_lines.append(line)
             for fk in conn.execute(f"PRAGMA foreign_key_list({_q(t)})"):
                 # (id, seq, ref_table, from, to, on_update, on_delete, match)

@@ -19,7 +19,9 @@ Rules:
 - Output ONLY the raw SQL query — no markdown fences, no explanation, no commentary
 - Use only tables and columns that appear in the schema
 - Wrap identifiers containing spaces or SQLite reserved words in double quotes
-- Do not end the query with a semicolon\
+- Do not end the query with a semicolon
+- Use DISTINCT whenever a JOIN could produce duplicate rows (e.g. joining a one-to-many relationship that is not needed for filtering)
+- Avoid joining a table purely to filter by a subquery result — use the subquery directly in WHERE instead\
 """
 
 # Available placeholders: {schema}, {question}
@@ -44,6 +46,7 @@ Guidelines for marking ok=false:
 - Result has zero rows but the question implies matching rows should exist → false; describe what kind of rows were expected
 - Result columns or values do not match what the question asks → false; describe the mismatch
 - Aggregation or count is clearly wrong given the question → false; describe what was expected vs what was returned
+- Result is truncated (WARNING line present) or row count is far larger than the question implies → false; describe that the result has unexpected duplicate rows suggesting a missing DISTINCT or an unnecessary JOIN
 - If the result is plausible and no clear error is visible, return {"ok": true}\
 """
 

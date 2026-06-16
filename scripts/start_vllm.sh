@@ -7,7 +7,7 @@ set -euo pipefail
 
 MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
-# ITER 3 — FP8 + prefix caching enabled
+# ITER 3 — FP8 + prefix caching (n-gram SD reverted: degraded performance on Qwen3 MoE)
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \

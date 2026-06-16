@@ -19,6 +19,7 @@ class ExecutionResult:
     columns: list[str] | None = None
     error: str | None = None
     row_count: int = 0
+    truncated: bool = False
 
     def render(self, max_rows: int = 10) -> str:
         """Compact text rendering for prompt context."""
@@ -31,7 +32,11 @@ class ExecutionResult:
             " | ".join(str(c) for c in row) for row in (self.rows or [])[:max_rows]
         )
         more = f"\n... ({self.row_count - max_rows} more rows)" if self.row_count > max_rows else ""
-        return f"OK: {self.row_count} rows.\nCOLUMNS: {cols}\nFIRST ROWS:\n{preview}{more}"
+        trunc_note = f"\nWARNING: result was truncated at {self.row_count} rows — actual result set is larger." if self.truncated else ""
+        return f"OK: {self.row_count} rows.{trunc_note}\nCOLUMNS: {cols}\nFIRST ROWS:\n{preview}{more}"
+
+
+MAX_RESULT_ROWS = 500
 
 
 def execute_sql(db_id: str, sql: str, timeout_seconds: float = 5.0) -> ExecutionResult:
@@ -45,7 +50,11 @@ def execute_sql(db_id: str, sql: str, timeout_seconds: float = 5.0) -> Execution
         ) as conn:
             cur = conn.execute(sql)
             cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchall()
-            return ExecutionResult(ok=True, rows=rows, columns=cols, row_count=len(rows))
+            rows = cur.fetchmany(MAX_RESULT_ROWS + 1)
+            truncated = len(rows) > MAX_RESULT_ROWS
+            if truncated:
+                rows = rows[:MAX_RESULT_ROWS]
+            row_count = len(rows)
+            return ExecutionResult(ok=True, rows=rows, columns=cols, row_count=row_count, truncated=truncated)
     except Exception as e:  # noqa: BLE001
         return ExecutionResult(ok=False, error=f"{type(e).__name__}: {e}")
