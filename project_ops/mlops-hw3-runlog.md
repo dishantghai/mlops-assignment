@@ -1703,3 +1703,134 @@ addresses category (a).
 patch is captured in `agent/prompts.py` as a marginal improvement in issue string
 quality (less prescriptive), even though it did not change the pass rate.
 
+---
+
+## Phase 6 — SLO Diagnosis
+
+### The Key Unknown Going In
+
+Phase 1 vLLM load tests ran at **10 vLLM RPS** directly. The agent serving **10 user RPS** drives approximately **25 effective vLLM RPS** (10 × 2.5 avg LLM calls per agent run: generate + verify + ~50% chance of revise). This is 2.5× the tested load.
+
+At 10 vLLM RPS (Iter 2 FP8):
+- ITL avg = 13.6ms/token (was 6.1ms single-request — 2.2× degradation)
+- Wall P95 per call = 1.498s
+
+At 25 vLLM RPS the degradation will compound. Little's Law: if avg E2E stays at 0.8s/call, concurrent LLM sequences = 25 × 0.8 = 20 (vs 8 at 10 RPS). More concurrent sequences in decode → worse ITL → worse wall P95.
+
+SLO math: if ITL degrades proportionally (≈ 2.5× from 10 to 25 vLLM RPS):
+- ITL estimate at 25 vLLM RPS: ~34ms/token
+- Per-call wall P95 estimate: TTFT(~50ms) + 56 tokens × 34ms ≈ 1.95s
+- Happy path (2 calls): ~3.9s → borderline
+- Revise path (3 calls): ~5.85s → likely SLO miss
+
+This pre-analysis tells us what to watch: **ITL under batch decode** is the binding constraint, not KV cache (2.5% peak in Iter 2) and not TTFT (chunked prefill keeps it bounded).
+
+### Diagnostic Framework
+
+If P95 misses 5.0s SLO, the decision tree:
+
+```
+P95 > 5s?
+├── TTFT high (> 200ms)?
+│   ├── KV cache > 80%? → preemption; lever: reduce max-num-seqs
+│   └── Queue depth growing? → concurrency ceiling; lever: reduce max-num-seqs
+└── ITL high (> 25ms/token)?
+    └── Compute-bound batch decode → lever: already on FP8; next: prefix caching
+        to reduce effective prompt tokens and lower per-call E2E
+```
+
+**Available levers in priority order:**
+1. `--enable-prefix-caching` — schemas repeat across requests; same DB → same schema prefix → KV blocks reused → lower effective TTFT per call
+2. `--max-num-seqs` reduction — cap concurrent sequences → lower batch size → lower ITL per token, at cost of queue depth
+3. `--gpu-memory-utilization` increase — more HBM for KV → more prefix cache hits (pairs with lever 1)
+
+### Phase 6 Experiment Log
+
+```
+SLO Diagnosis Log — Agent E2E @ 10 RPS, 300s
+
+SLO target: P95 < 5.0s
+
+─── Run 1: Iter 2 FP8, sync server ─────────────────────────────
+
+Config: --max-model-len 8192 --quantization fp8
+Server: def answer + graph.invoke (sync)
+
+Total requests: 3,000   Achieved RPS: ~8.3
+OK: 272 (9.1%)   Timeouts: 1,967   HTTP errors: 157   Disconnects: 604
+
+Agent E2E latency:
+  P50: 10.1s   P95: 103.4s   Max: ~120s
+
+SLO: [x] MISS by 98.4s
+Root cause: uvicorn sync thread pool (~32 threads) exhausted at t≈30s.
+  At 10 RPS × 6s avg = 60 concurrent > 32 threads → starvation → timeouts.
+
+─── Iteration 1: async server fix ──────────────────────────────
+
+Saw: Sync endpoint thread pool saturated. Only 272/3000 ok. P95=103.4s.
+  All failures are timeouts or client disconnects — not LLM errors.
+  Thread pool is the bottleneck, not vLLM.
+
+Hypothesized: async def answer + await graph.ainvoke() removes thread pool
+  from the critical path entirely. FastAPI event loop handles all concurrency
+  natively. LangGraph offloads sync nodes to asyncio thread executor.
+
+Changed: agent/server.py — def answer → async def answer,
+  graph.invoke → await graph.ainvoke(),
+  httpx.post → async with httpx.AsyncClient(): await client.post()
+
+Run 2 result: ok=359/3000 (12%), timeouts=1742, http_error=336,
+  disconnects=563; P50=50.9s, P95=114.6s; server crash at req ~2400.
+
+SLO: [x] Still missing by 109.6s
+Learning: Thread starvation fixed — server accepted all connections.
+  But vLLM throughput ceiling now exposed: async server cannot help when
+  the GPU itself is the bottleneck. P95 actually worsened because server
+  now queues more requests before vLLM falls over.
+
+─── Iteration 2: prefix caching ─────────────────────────────────
+
+Saw: vLLM collapses at 20-50 effective LLM RPS (10 user × 2-5 calls).
+  Sustainable vLLM cap ≈ 12 LLM RPS. Agent load is 2-4× over ceiling.
+  ITL degrades: 6ms (idle) → 100-400ms/token (60+ concurrent).
+  Each LLM call takes 10-20s → 3-call runs take 30-60s → all timeout.
+  Max sustainable user RPS = 12 / 2.5 ≈ 4.8 RPS — well below 10 RPS SLO.
+
+  Key observation: load pool has 9 DBs × ~167 questions each. Each DB's
+  schema prefix (~800 tokens) is IDENTICAL across all questions for that DB.
+  Without prefix caching, every call re-prefills the schema from scratch —
+  wasting GPU prefill budget on already-known tokens.
+
+Hypothesized: --enable-prefix-caching reuses KV blocks for the schema prefix.
+  After first request per DB, subsequent requests skip schema prefill entirely
+  (cache hit ≈ 5ms instead of 50ms). Lower per-call latency reduces concurrent
+  sequences → lower ITL → higher effective throughput ceiling.
+  Expected prefix hit rate: >80% (167 questions/DB, all sharing same schema).
+
+Changed: scripts/start_vllm.sh — --no-enable-prefix-caching → --enable-prefix-caching
+  (vLLM Iter 3 config)
+
+Metric moved: prefix cache hit rate: 0% → expected >80%
+  per-call TTFT: ~50ms → expected near-zero on cache hits
+P95 E2E after: *(pending — awaiting Iter 3 run)*
+SLO: [ ] Hit   [ ] Still missing by ___s
+Learning: *(fill after run)*
+
+─── Iteration 3 ─────────────────────────────────────────────────
+
+Saw: ___
+Hypothesized: ___
+Changed: ___
+Metric moved: ___ (from ___ to ___)
+P95 E2E after: ___s
+SLO: [ ] Hit   [ ] Still missing by ___s
+Learning: ___
+
+─── Final Config ─────────────────────────────────────────────────
+
+P95 E2E: ___s
+SLO verdict: [ ] Hit   [ ] Missed by ___s
+Eval pass rate maintained after tuning changes? [ ] Yes  [ ] Regressed
+```
+

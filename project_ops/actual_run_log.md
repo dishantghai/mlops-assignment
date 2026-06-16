@@ -12,6 +12,7 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 | 0 | no flags (BF16 defaults) | — | — | — | — | CRASH — KV OOM at startup |
 | 1 | `--max-model-len 8192 --no-prefix-cache` BF16 | 59ms | 1,059ms | **1.895s** | ~14% | 1200/1200 ok — revise path FAILS SLO (5.685s) |
 | 2 | + `--quantization fp8` | 59ms | 799ms | **1.498s** | ~2.5% | 1200/1200 ok — **revise path PASSES SLO (4.494s)** ✓ |
+| 3 | + `--enable-prefix-caching` | ___ | ___ | ___ | ___ | *(pending — agent load test Iter 2)* |
 
 ---
 
@@ -19,24 +20,24 @@ Educational detail lives in `mlops-hw3-runlog.md`.
 
 **File:** `scripts/start_vllm.sh`
 **Model:** `Qwen/Qwen3-30B-A3B-Instruct-2507`
-**Current iteration:** Iter 2 (FP8)
+**Current iteration:** Iter 3 (FP8 + prefix caching)
 
 ```bash
-# ITER 2 — FP8, capped context, prefix cache off
+# ITER 3 — FP8 + prefix caching enabled
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port 8000 \
     --max-model-len 8192 \
     --quantization fp8 \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
     --no-enable-chunked-prefill
 ```
 
 **Flag rationale:**
 - `--max-model-len 8192`: mandatory — BF16 default (262144) requires 24 GiB KV, more than the 8.68 GiB available. 8192 gives 5× headroom over our workload max (~1640 tokens).
 - `--quantization fp8`: halves weight footprint (57→29 GiB), frees 28 GiB for KV, reduces ITL under batch decode. Prescribed after Iter 1 confirmed revise path fails SLO by 0.69s.
-- `--no-enable-prefix-caching`: off for clean measurement; Iter 3 will enable this.
+- `--enable-prefix-caching`: enabled for Iter 3. Load test pool has 9 DBs × ~167 questions each — schema prefix repeats identically within each DB. First request per DB populates KV cache; subsequent requests skip schema prefill entirely. Expected hit rate >80%.
 - `--no-enable-chunked-prefill`: silently ignored for Qwen3MoE in vLLM 0.10.x (engine force-enables it regardless).
 
 ---
@@ -634,3 +635,111 @@ toxicology × 2) are schema value knowledge issues — unfixable by prompt alone
 **Saw:** 43.3% final, 40.0% iter0, +3.3pp. Loop helped 2, hurt 1. Biggest failure clusters: thrombosis_prediction (0/3) and toxicology (0/2) — schema value conventions unknown to the model. Prompt patch did not move the score.
 
 **Result:** Loop is net-positive but marginal (+3.3pp). Primary gap is generate_sql hallucinating schema value representations not derivable from the DDL. Accepting 43.3% as eval_baseline and 43.3% as eval_after_tuning — verify prompt patch is captured but ineffective.
+
+---
+
+## Phase 6 — SLO Diagnosis: Agent Load Test @ 10 RPS
+
+**Date:** 2026-06-16
+**Script:** `load_test/driver.py`
+**Pool:** `load_test/perf_pool.jsonl` (1500 questions, 9 DBs)
+**SLO:** P95 agent E2E latency < 5.0s sustained at 10 RPS for 300s
+**Starting config:** Iter 2 FP8 (`--max-model-len 8192 --quantization fp8`)
+
+### Pre-Run Projection
+
+From Iter 2 FP8 vLLM-level load test (10 vLLM RPS):
+- Per-call wall P95 = 1.498s
+- Agent at 10 user RPS drives ~25 effective vLLM RPS (10 × 2.5 avg LLM calls)
+- 2.5× more vLLM load than tested → ITL will degrade from 13.6ms
+
+Projected agent P95 at 10 user RPS (25 vLLM RPS, degraded ITL):
+
+| Path | Calls | Projection | SLO |
+|------|-------|------------|-----|
+| Happy path | 2 | > 2.996s (ITL will worsen) | Unknown |
+| Revise once | 3 | > 4.494s (ITL will worsen) | Unknown |
+
+### Load Test Run 1 — Iter 2 FP8, sync server (CATASTROPHIC FAILURE)
+
+```
+Config: --max-model-len 8192 --quantization fp8
+Server: sync endpoint (def answer + graph.invoke)
+
+Total requests:   3,000
+Achieved RPS:     ~8.3 (queue saturated early, not sustained)
+OK:               272 (9.1%)  |  Timeouts: 1,967  |  HTTP errors: 157  |  Client disconnects: 604
+
+Latency (agent E2E, full request including all LLM calls):
+  P50:  10.1s
+  P95:  103.4s   [SLO target: < 5.0s]
+  Max:  ~120s    (all timed out at client 120s limit)
+
+SLO verdict: [x] MISS by 98.4s
+
+Root cause: uvicorn sync thread pool exhaustion.
+  Default thread pool = ~32 threads. At 10 RPS × avg 6s/req = 60 concurrent
+  requests >> 32 threads → starvation by t=30s → queue backlog → 120s timeouts.
+```
+
+### Load Test Run 2 — Iter 2 FP8, async server (vLLM ceiling)
+
+```
+Config: --max-model-len 8192 --quantization fp8
+Server: async endpoint (async def answer + graph.ainvoke)
+
+Total requests:   3,000
+Achieved RPS:     ~8.3
+OK:               359 (12%)  |  Timeouts: 1,742  |  HTTP errors: 336  |  Client disconnects: 563
+
+Latency (agent E2E, full request including all LLM calls):
+  P50:  50.9s
+  P95:  114.6s   [SLO target: < 5.0s]
+  P99:  ~118s
+  Max:  ~120s
+
+SLO verdict: [x] MISS by 109.6s
+
+Root cause: vLLM throughput ceiling.
+  Sustainable vLLM capacity: ~12 LLM RPS.
+  Agent at 10 user RPS generates: 10 × 2-5 LLM calls = 20-50 effective vLLM RPS.
+  2-4× overload → ITL: 6ms (idle) → 100-400ms (60+ concurrent) → each LLM call
+  takes 10-20s → 3-call agent runs take 30-60s → timeout cascade.
+  Server OOM-crashed at req ~2400 from asyncio task backlog.
+  Max sustainable user RPS = 12 / 2.5 avg calls ≈ 4.8 user RPS.
+```
+
+### Iteration Log
+
+#### Iteration 1 — Async Server Fix
+
+**Saw:** Sync endpoint thread pool exhausted at t≈30s. Default ~32 uvicorn worker threads consumed by `def answer` handlers sleeping inside `graph.invoke()` (blocking sync LLM calls). At 10 RPS × 6s avg = 60 concurrent → 28 requests permanently blocked in thread queue → 120s timeouts cascade. 272/3000 ok (9.1%), P95=103.4s.
+
+**Hypothesized:** `async def answer` + `await graph.ainvoke()` removes thread pool from the critical path. FastAPI handles concurrency on the event loop; LangGraph offloads sync nodes to a thread executor internally. Should eliminate the starvation failure mode entirely.
+
+**Changed:** `def answer` → `async def answer`; `graph.invoke()` → `await graph.ainvoke()`; `httpx.post()` → `async with httpx.AsyncClient(): await client.post()` in `agent/server.py`.
+
+**Result:** Thread pool no longer exhausted. Server accepted all concurrent connections. But underlying vLLM throughput ceiling exposed: 359/3000 ok (12%), P95=114.6s, crash at req ~2400.
+
+**SLO:** [x] Still missing by 109.6s — different root cause now (vLLM overload, not server concurrency)
+
+#### Iteration 2 — Prefix Caching
+
+**Saw:** vLLM collapses under 20-50 effective LLM RPS from 10 user RPS × 2-5 agent calls. vLLM's sustainable throughput ceiling is ~12 LLM RPS. Every request in the load pool hits one of 9 fixed DBs — meaning the same schema prefix repeats across 100+ questions per DB. Without prefix caching, each call re-prefills the full ~800-token schema from scratch, wasting KV compute budget.
+
+**Hypothesized:** `--enable-prefix-caching` reuses KV blocks for the repeated schema prefix (same DB → same schema tokens → same KV hash → cache hit). After first request per DB, subsequent requests for that DB skip schema prefill → TTFT drops from ~50ms to near-zero for cache hits. Lower per-call latency → lower ITL at same concurrency → higher sustainable throughput ceiling.
+
+**Changed:** `--no-enable-prefix-caching` → `--enable-prefix-caching` in `scripts/start_vllm.sh` (Iter 3).
+
+**Metric moved:** prefix cache hit rate (0% → expect >80%), per-call TTFT (50ms → expect near-zero on cache hit)
+**P95 after:** *(pending — awaiting Iter 3 run)*
+**SLO:** [ ] Hit   [ ] Still missing by ___s
+
+#### Iteration 3 — (pending — awaiting prefix cache run)
+
+**Saw:** *(fill after run)*
+**Hypothesized:** *(fill after run)*
+**Changed:** *(fill after run)*
+**Metric moved:** *(fill after run)*
+**P95 after:** ___s
+**SLO:** [ ] Hit   [ ] Still missing by ___s

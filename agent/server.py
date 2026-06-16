@@ -9,8 +9,12 @@ the agent's final SQL, the result rows, and per-iteration history.
 Phase 4: Langfuse tracing is enabled when LANGFUSE_PUBLIC_KEY and
 LANGFUSE_SECRET_KEY are present in the environment. A fresh CallbackHandler
 is created per request so that traces do not cross-contaminate. After
-graph.invoke() completes, the trace is updated with agent-level metadata
+graph.ainvoke() completes, the trace is updated with agent-level metadata
 tags that Phase 6 uses for filtering in Langfuse.
+
+Phase 6: endpoint is async so the event loop handles concurrent requests
+without exhausting a thread pool. graph.ainvoke() is used instead of
+graph.invoke() — LangGraph runs sync nodes in a thread executor internally.
 """
 from __future__ import annotations
 
@@ -59,7 +63,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/answer", response_model=AnswerResponse)
-def answer(req: AnswerRequest) -> AnswerResponse:
+async def answer(req: AnswerRequest) -> AnswerResponse:
     # Fresh handler per request — prevents trace state leaking between calls.
     handler: Any = None
     if _LANGFUSE_ENABLED:
@@ -72,7 +76,10 @@ def answer(req: AnswerRequest) -> AnswerResponse:
         "metadata": req.tags,
     }
     try:
-        final = graph.invoke(state, config=config)
+        # ainvoke lets the event loop multiplex hundreds of concurrent agent
+        # runs without blocking — sync nodes inside the graph are offloaded
+        # to a thread executor by LangGraph automatically.
+        final = await graph.ainvoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
@@ -92,26 +99,27 @@ def answer(req: AnswerRequest) -> AnswerResponse:
         try:
             handler._langfuse_client.flush()
             lf_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3001")
-            httpx.post(
-                f"{lf_host}/api/public/traces",
-                auth=(
-                    os.environ["LANGFUSE_PUBLIC_KEY"],
-                    os.environ["LANGFUSE_SECRET_KEY"],
-                ),
-                json={
-                    "id": handler.last_trace_id,
-                    "name": "agent_run",
-                    "metadata": {
-                        "db_name": req.db,
-                        "num_iterations": iteration,
-                        "final_ok": bool(final.get("verify_ok", False)),
-                        "revise_triggered": iteration > 1,
-                        "question_id": req.question_id,
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{lf_host}/api/public/traces",
+                    auth=(
+                        os.environ["LANGFUSE_PUBLIC_KEY"],
+                        os.environ["LANGFUSE_SECRET_KEY"],
+                    ),
+                    json={
+                        "id": handler.last_trace_id,
+                        "name": "agent_run",
+                        "metadata": {
+                            "db_name": req.db,
+                            "num_iterations": iteration,
+                            "final_ok": bool(final.get("verify_ok", False)),
+                            "revise_triggered": iteration > 1,
+                            "question_id": req.question_id,
+                        },
+                        "tags": [req.db],
                     },
-                    "tags": [req.db],
-                },
-                timeout=5.0,
-            )
+                    timeout=5.0,
+                )
         except Exception:
             pass  # tracing must never break the answer endpoint
 
