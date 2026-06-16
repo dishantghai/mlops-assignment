@@ -445,3 +445,302 @@ llm().invoke(messages, extra_body={"chat_template_kwargs": {"enable_thinking": F
 
 **Temperature per node:** With thinking disabled, use `temperature=0.0` or `0.1` for generate and revise (deterministic SQL), and `temperature=0.3` for verify (the model needs some reasoning flexibility to judge whether a result is correct, but you still want consistency).
 
+---
+
+## Phase 1 Iteration Log — Iter 1 (BF16 Baseline)
+
+### Iter 1 Startup: What the vLLM Logs Told Us
+
+After adding `--max-model-len 8192`, vLLM started successfully. Key lines from the startup log:
+
+```
+Loading model weights took 56.9342 GiB and 273.13 seconds
+Available KV cache memory: 8.68 GiB
+Total KV cache capacity: 94,784 tokens
+Max model length: 8192
+```
+
+**Non-default args reported:**
+```
+enable_prefix_caching: False    ← --no-enable-prefix-caching flag is working
+enable_chunked_prefill: False   ← --no-enable-chunked-prefill flag appears active
+```
+
+**But the engine config said:**
+```
+chunked_prefill_enabled=True
+```
+
+**Discovery: `--no-enable-chunked-prefill` is silently ignored for Qwen3MoE in vLLM 0.10.x.**
+
+vLLM 0.10.x force-enables chunked prefill for MoE models. The flag appears in `non_default_args` as `False`, but the engine actually runs with it enabled. This is a known behaviour in vLLM: certain flags are overridden internally by model-specific logic and the override is not surfaced clearly.
+
+**Why this matters for our baseline:** Our "baseline with all optimizations off" has chunked prefill secretly on. We cannot disable it, so we can never test without it. This means our Iter 1 is already a partially-optimized config. What we can still measure cleanly: the BF16 vs FP8 difference, and the prefix caching effect (which IS off, as confirmed).
+
+**MoE kernel warning:**
+```
+WARNING: No config file found for H100_80GB_HBM3. Using default config.
+```
+vLLM has a curated expert-dispatch kernel config per GPU type. The H100_80GB_HBM3 config was missing in this vLLM version, so it falls back to a generic default. This means expert routing may be slightly suboptimal — but it's the same for every configuration we'll test, so comparisons are still valid.
+
+**KV capacity math from startup:**
+```
+94,784 total tokens / 8192 max per seq = ~11.57 worst-case concurrent sequences
+94,784 total tokens / 1,256 avg prompt = ~75 realistic concurrent sequences
+```
+Our actual workload (~1,200-token prompts) is nowhere near filling KV cache, even at 10 RPS. KV saturation is NOT a concern at this scale with this prompt length. The bottleneck will be compute.
+
+---
+
+### Latency Decomposition: TTFT, ITL, and E2E
+
+Before describing test results, it helps to understand what each metric measures:
+
+**TTFT — Time To First Token**
+The time from when the request arrives at vLLM until the first generated token is produced. This is dominated by the **prefill** phase: vLLM must process all input tokens in a single forward pass (or chunked across several passes with chunked prefill). For a 1,200-token prompt, this means 1,200 tokens must be attended over before any output begins.
+
+TTFT is especially sensitive to:
+- Queue depth: if 10 requests arrive simultaneously, the 10th must wait for 9 others' prefills to partially complete
+- Prompt length: longer prompts take more time to prefill
+- Chunked prefill: breaks long prefills into chunks interleaved with decode steps, which keeps TTFT bounded even under load
+
+**ITL — Inter-Token Latency (also called TPOT: Time Per Output Token)**
+The average time between consecutive output tokens for a given sequence. This is the decode phase speed. Each decode step is one forward pass that produces exactly one new token for every sequence currently in the decode batch.
+
+ITL is sensitive to:
+- Batch size: if 20 sequences are in decode simultaneously, each forward pass still generates 1 token per sequence — but the forward pass itself takes longer because it processes 20 sequences' KV caches simultaneously. ITL per sequence scales roughly linearly with batch size.
+- Model size and quantization: FP8 reduces memory bandwidth pressure → faster forward passes → lower ITL
+- KV cache access: at large batch sizes, KV cache reads dominate memory bandwidth; FP8 KV halves this
+
+**E2E — End-to-End latency (vLLM internal)**
+The total time vLLM spends on a request: `E2E = TTFT + (N_output_tokens × ITL)`. This is reported by vLLM's Prometheus histogram. It excludes HTTP overhead (TCP handshake, request parsing, response serialization) which is why it's always lower than the wall-clock time measured from the client.
+
+**Wall clock**
+What the Python client measures: `time.monotonic()` around the HTTP call. Includes everything: E2E + HTTP round-trip overhead. For the first request after server start, this can be 2–2.5s due to cold HTTP connection setup; subsequent warm requests are closer to E2E + 100–200ms.
+
+**The relationship:**
+```
+Wall clock ≈ E2E + HTTP overhead (~50–200ms warm)
+E2E        = TTFT + (N_output × ITL)
+```
+
+Knowing this decomposition lets you diagnose where latency is coming from:
+- TTFT high, ITL normal → queue congestion or slow prefill
+- ITL high, TTFT normal → large decode batch (too many concurrent sequences)
+- Both high → the system is overloaded
+
+---
+
+### Smoke Test: Establishing the Single-Request Baseline
+
+**Script:** `scripts/smoke_test.py`
+**Prompt:** formula_1 schema (13 tables, ~1,165 tokens of schema) + question = 1,206 prompt tokens
+
+First request (cold HTTP):
+```
+Wall clock: 2.50s  ← ~2.1s was HTTP cold-start overhead, not model compute
+```
+
+After pulling vLLM `/metrics` and computing incremental stats:
+```
+TTFT:  62ms   ← prefill of 1,206 tokens on H100 MoE = very fast
+ITL:   6.1ms  ← (0.337s total decode / 55 inter-token gaps)
+E2E:   399ms  ← vLLM's internal view: 62ms + 55 × 6.1ms ≈ 397ms ✓
+```
+
+**Interpretation:**
+- 62ms TTFT for 1,206 tokens = ~51,500 tokens/sec prefill throughput — extremely fast because MoE activates only ~3B params per pass
+- 6.1ms ITL at zero concurrency = 163 tokens/sec decode — this is the single-sequence decode speed; it will degrade as batch size grows
+- 399ms E2E is the theoretical minimum per LLM call for our heaviest prompt, with zero queueing
+
+**The important baseline assertion:** The model is fast in isolation. Under zero concurrency, a single generate_sql call on the worst-case prompt (formula_1 schema) completes in 399ms. The question is entirely about what happens under concurrent load.
+
+---
+
+### Thinking Mode Investigation
+
+**Script:** `scripts/test_thinking.py`
+**Motivation:** Qwen3 models have a thinking mode that produces `<think>...</think>` blocks before the answer. If triggered, output balloons to 600–2,500 tokens (from 60–180 tokens), making a single LLM call take 30+ seconds. Must confirm it's off before load testing.
+
+**Tests run:**
+| Temperature | Wall time | Output tokens | Thinking triggered |
+|---|---|---|---|
+| 0.7 (model default) | 0.62s | 88 | **No** |
+| 0.0 | 0.54s | 83 | **No** |
+
+**Why thinking is NOT triggered:**
+
+vLLM startup log showed: `reasoning_backend=''`
+
+Qwen3's thinking mode requires the chat template to inject a special `<think>` enable token at the start of the assistant turn. When `reasoning_backend` is empty, the OpenAI-compatible API endpoint does not use the thinking-aware chat template variant. The model receives a prompt that starts the assistant turn without the thinking trigger, so the model never enters reasoning mode.
+
+This is good news: we don't need `/no_think` in our prompts, and there's no hidden cost from accidental reasoning. Output lengths stay bounded at 60–180 tokens.
+
+**Note on temperature and thinking mode:** Some Qwen3 documentation suggests thinking fires more readily at higher temperatures. Even at temperature=0.7, it did not trigger in our vLLM setup. The `reasoning_backend=''` config is the reason — it's an API-level gate, not a sampling-level effect.
+
+**Warm call baseline after 3 total requests:**
+```
+Avg TTFT:  54ms  (vs 62ms first-call — consistent)
+Avg ITL:   6.1ms/token  (unchanged across all 3 calls — as expected at zero concurrency)
+KV cache:  0% (idle between requests — BF16 baseline has plenty of headroom)
+```
+
+---
+
+### 10-Concurrent Burst Test: Measuring Queue Pressure
+
+**Script:** `scripts/concurrent_test.py`
+**Design:** 10 threads launch simultaneously, each with a different formula_1 question (~1,218 tokens). This simulates what vLLM sees when a burst of requests arrives at once — the worst-case for queue depth.
+
+**Per-request results (sorted by completion time):**
+```
+[06] 1.09s  12 tokens  ← finished first: fewest output tokens
+[08] 1.50s  42 tokens
+[03] 1.54s  47 tokens
+[04] 1.63s  54 tokens
+[00] 1.67s  57 tokens
+[02] 1.70s  61 tokens
+[07] 1.76s  68 tokens
+[09] 1.81s  73 tokens
+[05] 1.82s  75 tokens
+[01] 1.85s  80 tokens  ← finished last: most output tokens
+```
+
+**Summary:**
+```
+P50: 1.70s  |  P95: 1.85s  |  Max: 1.85s
+```
+
+**vLLM metrics after test (incremental, 10 requests):**
+```
+Avg TTFT:  679ms  ← was 54ms single-request → 12.6× degradation
+Avg E2E:   1,439ms  ← was 399ms → 3.6× degradation
+```
+
+**Why TTFT degraded 12.6× but E2E only 3.6×:**
+
+All 10 requests arrived simultaneously. Even with chunked prefill, each request must wait in the prefill queue while the others get chunks processed. The last request in queue waited ~650ms before its first token — 12× longer than the 54ms idle TTFT.
+
+E2E (which includes TTFT + decode) degraded less because the decode phase was relatively fast (~6ms/token with a small output) and the requests completed as they finished their individual decode steps.
+
+**The output-latency correlation:**
+Request [06] produced only 12 tokens and finished in 1.09s. Request [01] produced 80 tokens and took 1.85s. The difference is 0.76s for 68 extra tokens at ~11ms/token — slightly higher than the 6.1ms single-request ITL, because in a concurrent batch each decode step serves all sequences but the step itself takes longer. This confirms that under 10 concurrent sequences, effective ITL per sequence is about 1.8× the single-request baseline.
+
+**SLO implications from this test:**
+```
+Happy path (2 LLM calls × 1.85s P95): 3.70s  → PASS SLO (< 5.0s)
+Revise path (3 LLM calls × 1.85s P95): 5.55s → FAIL SLO (+0.55s over)
+```
+
+But this 10-concurrent test is a burst, not a sustained load. At true 10 RPS:
+- Little's Law: N_concurrent = λ × W = 10 RPS × ~1.5s avg agent call = ~15 concurrent vLLM sequences
+- Actually 10 user RPS × ~2.5 LLM calls/user = 25 effective vLLM RPS
+- Little's Law on vLLM: 25 RPS × 1.5s = ~37 concurrent sequences → worse than this 10-concurrent test
+
+The 10-concurrent burst was a data point, but not definitive. It justified running the full sustained load test.
+
+---
+
+### Sustained 10 RPS Load Test: Confirming the Failure Mode
+
+**Script:** `scripts/vllm_load_test.py`
+**Design:** Fires requests directly at vLLM port 8000 (bypassing agent — Phase 3 not implemented yet) at exactly 10 RPS for 120 seconds. Samples questions from all 9 databases in `evals/eval_set.jsonl` using real schema+question pairs, so prompt sizes vary realistically (376–1,338 tokens). Uses `asyncio` + `aiohttp` for accurate rate control.
+
+**Why test vLLM directly instead of the agent:**
+The agent's `verify_node` and `revise_node` are not yet implemented (they raise `NotImplementedError`). But vLLM is the bottleneck — it's the shared resource that all agent nodes consume. Testing vLLM at 10 RPS gives us the per-call latency distribution, which we can then multiply by the number of calls per agent run to project agent SLO compliance.
+
+**Results: 1,200 requests, 120 seconds**
+
+```
+Achieved RPS:     9.93  (target: 10.0)
+Success rate:     1200/1200 — 0 timeouts, 0 HTTP errors
+
+Wall-clock latency (client-side):
+  P50:  0.971s
+  P95:  1.895s  ← SLO boundary = 5.0s per AGENT request
+  P99:  2.285s
+  Max:  2.394s
+```
+
+**vLLM Prometheus metrics (cumulative post-test, 1,213 requests total including pre-test smoke runs):**
+
+| Metric | Value | vs Single-Request | Degradation |
+|---|---|---|---|
+| TTFT avg | 52.2ms | 62ms | Better (warm) |
+| TTFT P95 | 59.4ms | — | Near-idle (97.7% ≤ 60ms) |
+| ITL avg | 18.0ms/token | 6.1ms/token | **3.0× worse** |
+| E2E avg | 1,059ms | 399ms | **2.7× worse** |
+| Avg output | 55.8 tokens | 56 tokens | Same |
+
+**Why TTFT stayed healthy (59ms P95) but ITL tripled:**
+
+This is the key insight from the test, and it's directly caused by chunked prefill:
+
+*Chunked prefill* breaks each long prompt into smaller chunks (default chunk size = 512 tokens in vLLM). Decode steps interleave between prefill chunks. This keeps TTFT bounded even when many requests arrive at once — each request gets prefill chunks processed incrementally, so no request is completely blocked behind a wall of full prefills.
+
+Result: at 10 RPS, TTFT barely moved (52ms avg, 59ms P95) because chunked prefill prevented prefill monopolization.
+
+*But ITL tripled.* Why? Because at 10 RPS with avg 1.059s per call (Little's Law: 10 × 1.059 = ~10.6 concurrent sequences in decode), each decode forward pass generates 1 token for all ~10 concurrent sequences simultaneously. The forward pass itself takes ~180ms at this batch size (vs ~6ms for a single sequence). Each individual sequence waits for all others in the batch → ITL per sequence = ~18ms instead of 6ms.
+
+This is a fundamental tension in batched inference:
+- **Chunked prefill** protects TTFT under load at the cost of slightly increased ITL (prefill chunks steal some decode slots)
+- **Large decode batches** improve total throughput (tokens/second across all sequences) but worsen per-sequence ITL
+
+**KV cache utilization analysis:**
+
+At 10 RPS with 1.059s avg E2E:
+- Little's Law concurrent sequences: 10 × 1.059 = **10.59 concurrent**
+- Avg prompt length: ~1,256 tokens
+- KV cache used: 10.59 × 1,256 tokens × 192 KB/token = 2,551 MB ≈ **2.5 GB**
+- Available KV budget: 8.68 GiB = 8,889 MB
+- **KV utilization: ~14%** — completely unconstrained
+
+KV cache is NOT the bottleneck at 10 RPS. The model has 86% KV headroom. This means:
+- Preemption is not occurring
+- Increasing `--max-num-seqs` would have zero effect
+- The failure is purely compute-bound (ITL degradation from batch decode)
+
+**SLO Analysis: The Actual Verdict**
+
+Single vLLM call at 10 RPS load:
+```
+P95 wall clock = 1.895s
+```
+
+Agent path projections (vLLM calls are sequential within a single agent run):
+```
+Happy path  (generate + verify = 2 calls):  2 × 1.895 = 3.79s  → PASS SLO ✓
+Revise path (generate + verify + revise = 3 calls): 3 × 1.895 = 5.69s → FAIL SLO ✗ (+0.69s)
+```
+
+But these projections are optimistic. They assume the agent is driving 10 vLLM RPS. In reality:
+- 10 user agent RPS × ~2.5 avg LLM calls/agent = **25 effective vLLM RPS**
+- We tested at 10 vLLM RPS. At 2.5× the load, ITL will worsen further
+- The happy path margin (3.79s vs 5.0s SLO) may erode at 25 vLLM RPS
+
+**This is the observed failure that justifies the next change.**
+
+---
+
+### FP8 Quantization: Why It's Prescribed Now (Not Before)
+
+In a scientific tuning process, you never add a flag before observing the failure it addresses. Before the load test, we had:
+- Single-request E2E: 399ms (looks great — no apparent problem)
+- 10-concurrent TTFT: 12.6× worse but P95 still only 1.85s (borderline on revise path)
+
+The sustained load test provided the concrete failure: **at true 10 RPS load, the revise path exceeds the 5s SLO by 0.69s, and the effective vLLM RPS under a real agent (2.5× multiplier) will push even the happy path toward its margin.**
+
+The bottleneck is compute throughput — specifically, ITL degrading 3× under batch decode pressure. FP8 addresses this directly:
+
+**Memory bandwidth effect:**
+- BF16 weights: 57 GB → memory bandwidth for weight reads during forward pass is the bottleneck
+- FP8 weights: 31 GB → same forward pass reads 1.8× less data → faster matrix multiplies → lower ITL
+
+**KV cache headroom effect:**
+- BF16: 8.68 GiB KV budget
+- FP8 weights free ~26 GiB → KV budget grows to ~34 GiB → 4× more concurrent sequences before saturation
+
+**Expected outcome:** ITL should decrease from 18ms → ~9–12ms under similar load (improved compute throughput). TTFT should remain similarly bounded (chunked prefill is still on). The revise path projection drops from 5.69s to ~3.8–4.5s → under the 5s SLO.
+
+This is a hypothesis. The next iteration (Iter 2) will measure it.
+
