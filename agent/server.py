@@ -3,14 +3,21 @@
 Run:
     uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
 
-The /answer endpoint accepts {question, db, tags?} and returns the
-agent's final SQL, the result rows, and per-iteration history.
+The /answer endpoint accepts {question, db, question_id?, tags?} and returns
+the agent's final SQL, the result rows, and per-iteration history.
+
+Phase 4: Langfuse tracing is enabled when LANGFUSE_PUBLIC_KEY and
+LANGFUSE_SECRET_KEY are present in the environment. A fresh CallbackHandler
+is created per request so that traces do not cross-contaminate. After
+graph.invoke() completes, the trace is updated with agent-level metadata
+tags that Phase 6 uses for filtering in Langfuse.
 """
 from __future__ import annotations
 
 import os
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -19,14 +26,10 @@ load_dotenv()
 
 from agent.graph import AgentState, graph  # noqa: E402
 
-# Langfuse callback handler. If keys are set we initialize it; failures
-# are NOT swallowed - a misconfigured Langfuse should not silently
-# produce zero traces.
-_lf_handler: Any = None
-if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-    from langfuse.langchain import CallbackHandler
-
-    _lf_handler = CallbackHandler()
+# True when both Langfuse keys are present in the environment.
+_LANGFUSE_ENABLED = bool(
+    os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+)
 
 
 app = FastAPI()
@@ -35,6 +38,9 @@ app = FastAPI()
 class AnswerRequest(BaseModel):
     question: str
     db: str
+    # Optional stable identifier for the question; used as a Langfuse
+    # metadata tag so eval results can be cross-referenced with traces.
+    question_id: str | None = None
     tags: dict[str, str] = {}
 
 
@@ -54,9 +60,15 @@ def health() -> dict[str, str]:
 
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
+    # Fresh handler per request — prevents trace state leaking between calls.
+    handler: Any = None
+    if _LANGFUSE_ENABLED:
+        from langfuse.langchain import CallbackHandler
+        handler = CallbackHandler()
+
     state = AgentState(question=req.question, db_id=req.db)
     config: dict[str, Any] = {
-        "callbacks": [_lf_handler] if _lf_handler is not None else [],
+        "callbacks": [handler] if handler is not None else [],
         "metadata": req.tags,
     }
     try:
@@ -68,6 +80,40 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     iteration = final.get("iteration", 0)
     history = final.get("history", [])
     execution = final.get("execution")
+
+    # ── Phase 4: post-run trace metadata ──────────────────────────────────────
+    # iteration==1 → only generate_sql ran (no revise)
+    # iteration>=2 → at least one revise cycle fired
+    #
+    # langfuse 4.x dropped Langfuse.trace(); use the REST upsert endpoint
+    # instead. POST /api/public/traces with the existing trace ID merges our
+    # fields into the trace that the LangChain callback already created.
+    if handler is not None:
+        try:
+            handler._langfuse_client.flush()
+            lf_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3001")
+            httpx.post(
+                f"{lf_host}/api/public/traces",
+                auth=(
+                    os.environ["LANGFUSE_PUBLIC_KEY"],
+                    os.environ["LANGFUSE_SECRET_KEY"],
+                ),
+                json={
+                    "id": handler.last_trace_id,
+                    "name": "agent_run",
+                    "metadata": {
+                        "db_name": req.db,
+                        "num_iterations": iteration,
+                        "final_ok": bool(final.get("verify_ok", False)),
+                        "revise_triggered": iteration > 1,
+                        "question_id": req.question_id,
+                    },
+                    "tags": [req.db],
+                },
+                timeout=5.0,
+            )
+        except Exception:
+            pass  # tracing must never break the answer endpoint
 
     if execution is None:
         return AnswerResponse(
