@@ -1154,5 +1154,144 @@ Issues: ___________________________
 Data source: Prometheus at http://prometheus:9090  (Docker network, not localhost)
 ```
 
-**Note on data source URL:** Grafana is running in Docker. It cannot reach `localhost:8000` — it must use the Docker network hostname. Prometheus scrapes vLLM at `http://172.18.0.3:8000/metrics` (or whatever the vLLM container IP is). Grafana queries Prometheus at `http://prometheus:9090` via the Docker network. This is already configured in the Docker compose setup.
+**Note on data source URL:** Grafana is running in Docker. It cannot reach `localhost:8000` — it must use the Docker network hostname. Prometheus scrapes vLLM at `http://host.docker.internal:8000/metrics` (confirmed from targets API). Grafana queries Prometheus at `http://prometheus:9090` via the Docker network. This is already configured in the Docker compose setup.
+
+---
+
+### How to Manually Test a Prometheus Metric
+
+Three methods, from quickest to most powerful. Use these to verify a metric exists and has data **before** building a Grafana panel for it.
+
+---
+
+#### Method 1: Grep the raw vLLM `/metrics` endpoint
+
+No Prometheus involved — reads directly from vLLM. Best for checking a metric name and its current raw value.
+
+```bash
+# Exact metric name
+curl -s localhost:8000/metrics | grep "vllm:kv_cache_usage_perc"
+
+# Partial name match
+curl -s localhost:8000/metrics | grep "queue_time"
+
+# All non-bucket lines for a histogram family (sum, count, without the bucket noise)
+curl -s localhost:8000/metrics | grep "vllm:e2e_request_latency" | grep -v "_bucket"
+
+# Everything vLLM exposes, sorted, no comments, no buckets
+curl -s localhost:8000/metrics | grep -v "^#" | grep "^vllm:" | grep -v "_bucket" | grep -v "_created" | sort
+```
+
+**When to use:** Confirming a metric name, checking a gauge value instantly, reading the `cache_config_info` labels.
+
+---
+
+#### Method 2: Query the Prometheus HTTP API
+
+Tests the **exact PromQL** you will paste into Grafana. If this returns data, the panel will work. If it returns an empty result, the panel will be blank.
+
+```bash
+# Simple gauge — just the metric name
+curl -s "localhost:9090/api/v1/query" \
+  --data-urlencode 'query=vllm:kv_cache_usage_perc' | python3 -m json.tool
+
+# Histogram quantile — the full expression for a P95 panel
+curl -s "localhost:9090/api/v1/query" \
+  --data-urlencode 'query=histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))' \
+  | python3 -m json.tool
+
+# Counter rate — throughput in tokens/sec
+curl -s "localhost:9090/api/v1/query" \
+  --data-urlencode 'query=rate(vllm:generation_tokens_total[1m])' | python3 -m json.tool
+
+# Check scrape targets — are they up or down?
+curl -s "localhost:9090/api/v1/targets" | python3 -m json.tool | grep -E '"health"|"scrapeUrl"|"lastError"'
+```
+
+**Confirmed from our diagnostic run:**
+```
+"scrapeUrl": "http://host.docker.internal:8000/metrics"
+"health": "up"
+"lastError": ""
+```
+Prometheus is scraping vLLM every 5 seconds with no errors.
+
+**Sample response for a working metric:**
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [{
+      "metric": {
+        "__name__": "vllm:kv_cache_usage_perc",
+        "engine": "0",
+        "instance": "host.docker.internal:8000",
+        "job": "vllm",
+        "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+      },
+      "value": [1781621250.121, "0"]
+    }]
+  }
+}
+```
+The `"value"` array is `[unix_timestamp, "metric_value"]`. An empty `"result": []` means Prometheus has no data for that query.
+
+**When to use:** Before building any Grafana panel. If this returns data, the panel will work.
+
+---
+
+#### Method 3: Prometheus UI (Browser)
+
+Open `localhost:9090` → **Graph** tab. Type any metric or PromQL into the expression box → **Execute**.
+
+**Common gotcha:** The URL `localhost:9090/graph?g0.expr=&g0.tab=0` shows **no data because `g0.expr=` is empty** — the expression field is blank. You must type a query. The graph page never auto-populates.
+
+Useful pre-filled URLs to bookmark:
+
+```
+# KV cache utilization
+localhost:9090/graph?g0.expr=vllm%3Akv_cache_usage_perc*100&g0.tab=0&g0.range_input=1h
+
+# Requests running + waiting (paste both in separate panels)
+localhost:9090/graph?g0.expr=vllm%3Anum_requests_running&g0.tab=0&g0.range_input=1h
+
+# E2E latency P95
+localhost:9090/graph?g0.expr=histogram_quantile(0.95%2C+sum(rate(vllm%3Ae2e_request_latency_seconds_bucket%5B5m%5D))+by+(le))&g0.tab=0&g0.range_input=1h
+
+# TTFT P95
+localhost:9090/graph?g0.expr=histogram_quantile(0.95%2C+sum(rate(vllm%3Atime_to_first_token_seconds_bucket%5B5m%5D))+by+(le))&g0.tab=0&g0.range_input=1h
+```
+
+Check **Status → Targets** at `localhost:9090/targets` to verify the vLLM scrape job is green (UP) before debugging anything else.
+
+**When to use:** Exploring metric names interactively (autocomplete works), visualising a time-series quickly, checking `Status → Targets` to diagnose scrape failures.
+
+---
+
+#### Diagnostic Decision Tree
+
+```
+Panel shows no data in Grafana?
+│
+├─ Step 1: Is vLLM running?
+│   curl -s localhost:8000/health
+│   → no response: restart vLLM
+│
+├─ Step 2: Does the metric exist in vLLM /metrics?
+│   curl -s localhost:8000/metrics | grep "METRIC_NAME"
+│   → not found: wrong metric name
+│
+├─ Step 3: Is Prometheus scraping successfully?
+│   curl -s localhost:9090/api/v1/targets | python3 -m json.tool | grep health
+│   → "down": Prometheus can't reach vLLM (check Docker network / host.docker.internal)
+│
+├─ Step 4: Does the PromQL return data from Prometheus?
+│   curl -s "localhost:9090/api/v1/query" --data-urlencode 'query=PROMQL' | python3 -m json.tool
+│   → empty result []: PromQL is wrong, or rate() window too short (try [10m])
+│
+└─ Step 5: Is Grafana data source configured?
+    Grafana → Connections → Data Sources → Prometheus → Test
+    → error: URL should be http://prometheus:9090 (Docker hostname, not localhost)
+```
 
