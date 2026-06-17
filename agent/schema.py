@@ -58,8 +58,8 @@ def render_schema(db_id: str) -> str:
                         f"SELECT DISTINCT {_q(name)} FROM {_q(t)} "
                         f"WHERE {_q(name)} IS NOT NULL LIMIT 11"
                     ).fetchall()
-                    if 1 <= len(rows) <= 10 and all(len(str(r[0])) <= 25 for r in rows):
-                        examples = ", ".join(_fmt_val(r[0]) for r in rows[:3])
+                    if 1 <= len(rows) <= 10 and all(len(str(r[0])) <= 4 for r in rows):
+                        examples = ", ".join(_fmt_val(r[0]) for r in rows)
                         line += f"  /* e.g. {examples} */"
                 col_lines.append(line)
             for fk in conn.execute(f"PRAGMA foreign_key_list({_q(t)})"):

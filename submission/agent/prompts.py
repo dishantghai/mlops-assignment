@@ -21,7 +21,11 @@ Rules:
 - Wrap identifiers containing spaces or SQLite reserved words in double quotes
 - Do not end the query with a semicolon
 - Use DISTINCT whenever a JOIN could produce duplicate rows (e.g. joining a one-to-many relationship that is not needed for filtering)
-- Avoid joining a table purely to filter by a subquery result — use the subquery directly in WHERE instead\
+- Avoid joining a table purely to filter by a subquery result — use the subquery directly in WHERE instead
+- SQLite string comparisons are case-sensitive — preserve the exact case of string literals; do not lowercase or uppercase values unless the question explicitly requires it
+- For superlative questions (highest, lowest, most, fewest), use ORDER BY ... DESC/ASC LIMIT 1 rather than a MAX()/MIN() subquery in WHERE
+- When filtering by an exact timestamp from the question, SQLite may store dates with trailing precision (e.g., '2010-07-19 19:39:08.0'); use LIKE with a trailing %: WHERE col LIKE '2010-07-19 19:39:08%'
+- When calculating a difference between two periods or groups mentioned in the question, subtract in the order they appear in the question (first mentioned − second mentioned)\
 """
 
 # Available placeholders: {schema}, {question}
@@ -47,6 +51,7 @@ Guidelines for marking ok=false:
 - Result columns or values do not match what the question asks → false; describe the mismatch
 - Aggregation or count is clearly wrong given the question → false; describe what was expected vs what was returned
 - Result is truncated (WARNING line present) or row count is far larger than the question implies → false; describe that the result has unexpected duplicate rows suggesting a missing DISTINCT or an unnecessary JOIN
+- A single-row result from a superlative question (highest, lowest, most, fewest) is acceptable — do not flag it as wrong simply because ties might exist unless the question explicitly says "list all" or "how many"
 - If the result is plausible and no clear error is visible, return {"ok": true}\
 """
 

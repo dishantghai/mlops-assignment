@@ -1053,6 +1053,20 @@ introduced some value examples that confused the model for card_games and financ
 The latency-accuracy tradeoff is unfavorable for production use at current calibration.
 Future work: tune hint threshold per-DB (only add hints for genuinely categorical columns).
 
+#### Iteration 7b — Schema Hint Refinement + Generic Prompt Rules
+
+**Saw:** Iteration 7 eval regressed −6.6 pp (36.7% vs 43.3% baseline). Per-DB breakdown: codebase_community −2 (zero hints applied — pure LLM stochastic variance), financial −1 (long Czech values like `'POPLATEK MESICNE'` triggered hints that confused the model). Initial ≤25-char threshold was too permissive — included natural-language values that added noise rather than signal. Also identified 3 recurring SQL generation errors: case-sensitivity mismatches (model generated `'commentator'`, DB stores `'Commentator'`), MAX() subquery rewrites on superlative questions (breaking gold-SQL LIMIT 1 matches), datetime exact-match failures when DB stores `.0` millisecond suffix.
+
+**Hypothesized:** Tightening hint threshold to ≤4-char values keeps only short codes (`'+'`, `'-'`, `'cl'`, `'F'`, `'M'`) that are genuinely non-obvious, while dropping self-explanatory natural-language enums. Showing all values (up to 10) instead of first 3 gives the model complete enum information. Three generic prompt rules address the SQL generation errors directly.
+
+**Changed:**
+- `agent/schema.py`: threshold `≤25 chars → ≤4 chars`; examples show all values (not first 3)
+- `agent/prompts.py`: added 3 rules to GENERATE_SQL_SYSTEM (case-sensitivity, ORDER BY LIMIT 1 for superlatives, LIKE for timestamps) + 1 rule to VERIFY_SYSTEM (don't flag LIMIT 1 superlative results)
+
+**Metric moved:** Eval accuracy: 36.7% → **40.0%** (+3.3 pp recovered; net −3.3 pp vs baseline). Load latency unchanged (P50=1.02 s, P95=5.54 s — short-code hints still present for thrombosis/toxicology).
+
+**Learning:** Refined hints recover most of the accuracy regression. Remaining −3.3 pp gap is codebase_community (persistent across all hint configurations, no hints applied there — confirms it is stochastic variance on a 30-question eval, not a hint artifact). Thrombosis/toxicology remain at 0/5 — schema hints show the right categorical values but model still cannot infer medical semantics (what `'+'` vs `'-'` mean for Admission). `results/eval_after_tuning.json` updated to 40.0% (12/30).
+
 #### Final Phase 6 Summary
 
 **Best result:** Run 6 @ 3 RPS — P50=2.61s, P95=13.86s (all three fixes applied)

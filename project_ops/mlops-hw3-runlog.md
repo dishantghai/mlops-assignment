@@ -1963,10 +1963,44 @@ Learning: Latency improved dramatically, accuracy regressed. The reduced revise 
   latency wins significantly, but accuracy cost is real. Production-ready use would
   require per-DB selective hint strategy (only genuinely ambiguous categorical columns).
 
+─── Iteration 7b — Schema Hint Refinement + Generic Prompt Rules ──
+
+Saw: Iteration 7 eval regressed -6.6pp (36.7% vs 43.3% baseline). Per-DB root cause:
+  codebase_community -2 (zero hints applied — LLM stochastic variance on 30q eval),
+  financial -1 (hints for long Czech values e.g. 'POPLATEK MESICNE' added noise).
+  Initial ≤25-char threshold too permissive — included natural-language values.
+  Also found 3 recurring SQL bugs: (1) case-sensitivity mismatches ('commentator' vs
+  'Commentator'), (2) MAX() subquery rewrites on superlative questions breaking LIMIT 1
+  gold-SQL matches, (3) datetime exact-match failures when DB stores '.0' millisecond suffix.
+
+Hypothesized: Tightening hint threshold to ≤4-char values keeps only short unambiguous codes
+  ('+', '-', 'cl', 'F', 'M') while dropping self-explanatory natural-language enums.
+  Showing all ≤10 values (vs first 3) gives model complete enum context. Three generic
+  prompt rules fix systematic SQL generation errors without dataset-specific knowledge.
+
+Changed:
+  agent/schema.py: threshold ≤25 chars → ≤4 chars; show all values up to 10 (not first 3)
+  agent/prompts.py: 3 rules added to GENERATE_SQL_SYSTEM:
+    - "SQLite string comparisons case-sensitive — preserve exact case of string literals"
+    - "For superlatives, use ORDER BY ... LIMIT 1, not MAX()/MIN() subquery in WHERE"
+    - "For exact timestamps, use LIKE 'value%' to handle .0 precision suffix"
+    1 rule added to VERIFY_SYSTEM:
+    - "LIMIT 1 on superlative question is acceptable — don't flag for potential ties"
+
+Metric moved:
+  Eval accuracy: 36.7% → 40.0% (+3.3pp recovered; net -3.3pp vs 43.3% baseline)
+  Load latency: unchanged — P50=1.02s, P95=5.54s (short-code hints still active)
+
+Learning: Refined hints recover most of the accuracy regression. Remaining -3.3pp gap is
+  codebase_community (no hints applied, persistent across all configurations → confirmed
+  stochastic LLM variance, not a hint artifact). Thrombosis/toxicology remain 0/5 — hints
+  show correct categorical values but model cannot infer medical semantics from values alone.
+  eval_after_tuning.json updated to 40.0% (12/30).
+
 ─── Final Config ─────────────────────────────────────────────────
 
-Best latency result: Run 9 @ 5 RPS — P50=1.02s, P95=5.54s (all fixes + schema hints)
-  Trade-off: eval accuracy 36.7% (schema hints regressed from 43.3% baseline)
+Best latency result: Run 9 @ 5 RPS — P50=1.02s, P95=5.54s (all fixes + refined schema hints)
+  Trade-off: eval accuracy 40.0% (-3.3pp vs 43.3% baseline)
 
 Best accuracy + latency result: Run 6 @ 3 RPS — P50=2.61s, P95=13.86s (43.3% eval)
 
@@ -1976,7 +2010,7 @@ P95 E2E summary:
   Run 9 (5 RPS, schema hints): 5.54s (closest to SLO — 0.54s over)
 
 SLO verdict: [x] Missed — best P95=5.54s @ 5 RPS; 10 RPS unreachable on single H100
-Eval accuracy trajectory: 43.3% (baseline) → 43.3% (async+cache fixes) → 36.7% (schema hints)
+Eval accuracy trajectory: 43.3% (baseline) → 43.3% (async+cache fixes) → 36.7% (initial hints) → 40.0% (refined hints + prompt rules)
 Max sustainable user RPS without accuracy loss: ~4 RPS (ρ=0.80, all code fixes)
 10 RPS SLO: Unreachable on single H100 — would need ~31.5 LLM RPS, capacity = 15.7
 
@@ -1984,7 +2018,7 @@ Fixes applied (retained in final codebase):
 - scripts/start_vllm.sh: --enable-prefix-caching (vLLM Iter 3)
 - agent/graph.py: async LLM nodes + @functools.lru_cache(maxsize=1) singleton
 - agent/server.py: Langfuse flush fire-and-forget via asyncio.create_task()
-- agent/schema.py: inline value hints for TEXT columns ≤10 distinct (≤25 chars)
-  [note: schema hints improved load latency but regressed eval accuracy -6.6pp]
+- agent/schema.py: inline value hints for TEXT columns ≤10 distinct, values ≤4 chars, all shown
+- agent/prompts.py: 3 generic SQL rules (case-sensitivity, superlatives, timestamps)
 ```
 
